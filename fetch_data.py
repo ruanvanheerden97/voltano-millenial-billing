@@ -66,15 +66,44 @@ DAILY_COL_MAP = {
     "powerToGrid":     "Grid Exported Energy (kWh)",
 }
 
-# --- BILLING RUN ASSIGNMENT ---------------------------------------------------
+import json
+
+# --- BILLING RUN CONFIG -------------------------------------------------------
+
+def load_billing_runs() -> list[dict]:
+    """
+    Load billing run schedule from billing_runs.json.
+    Returns list of dicts sorted by end_date ascending.
+    """
+    config_path = Path(__file__).parent / "billing_runs.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"billing_runs.json not found at {config_path}\n"
+            "Create it with your billing run end dates."
+        )
+    with open(config_path) as f:
+        data = json.load(f)
+    runs = data["billing_runs"]
+    # Sort by end date ascending
+    runs = sorted(runs, key=lambda r: r["end_date"])
+    return runs
 
 def get_billing_run(d: date) -> str:
     """
-    Assign a date to its billing run name (e.g. 'Jan 2026').
-    Billing runs end on the last day of each month.
-    Adjust the cutoff days below if your billing runs end on a different day.
+    Assign a date to its billing run name using billing_runs.json.
+    Each run covers from the day after the previous run ended
+    up to and including its own end_date.
+    Dates before the first run end date → first run name.
+    Dates after the last run end date → 'Pending'.
     """
-    return d.strftime("%b %Y")
+    runs = load_billing_runs()
+
+    for run in runs:
+        end = date.fromisoformat(run["end_date"])
+        if d <= end:
+            return run["name"]
+
+    return "Pending"
 
 # --- AUTHENTICATION -----------------------------------------------------------
 
@@ -131,9 +160,28 @@ def fetch_day(token: str, day: date) -> dict | None:
 # --- DATA PROCESSING ----------------------------------------------------------
 
 def build_hourly_rows(day: date, data: dict) -> list[dict]:
-    """Convert API itemList into rows for the hourly sheet."""
+    """
+    Convert API itemList into per-interval usage rows for the hourly sheet.
+
+    The API returns CUMULATIVE daily totals in each interval (resetting at midnight).
+    We convert these to per-interval USAGE by subtracting the previous interval value.
+    This gives the actual energy used/produced in each 5-minute slot.
+
+    Example:
+        API row 1: pvTotalPower = 1.5  (cumulative from midnight)
+        API row 2: pvTotalPower = 3.2
+        Stored row 1: 1.5 - 0.0 = 1.5 kWh used in interval 1
+        Stored row 2: 3.2 - 1.5 = 1.7 kWh used in interval 2
+    """
+    items = data.get("itemList", [])
+    if not items:
+        return []
+
     rows = []
-    for item in data.get("itemList", []):
+    # Track previous cumulative values per field — reset at midnight (first item of day)
+    prev_values = {api_field: 0.0 for api_field in HOURLY_COL_MAP}
+
+    for item in items:
         dt_str = item.get("dataTime", "")
         try:
             dt = pd.Timestamp(dt_str)
@@ -142,20 +190,51 @@ def build_hourly_rows(day: date, data: dict) -> list[dict]:
 
         row = {"Date": dt}
         for api_field, col_name in HOURLY_COL_MAP.items():
-            row[col_name] = float(item.get(api_field, 0) or 0)
+            current = float(item.get(api_field, 0) or 0)
+            prev    = prev_values[api_field]
+
+            # If current < prev it means the cumulative reset (shouldn't happen mid-day
+            # but handle gracefully — treat as a fresh start from current value)
+            if current < prev:
+                delta = current
+            else:
+                delta = current - prev
+
+            row[col_name]        = round(delta, 6)
+            prev_values[api_field] = current
+
         rows.append(row)
     return rows
 
-def build_daily_row(day: date, data: dict) -> dict:
-    """Convert API daily summary into a row for the daily sheet."""
+def build_daily_row(day: date, hourly_rows: list[dict]) -> dict:
+    """
+    Build daily summary row by summing the already-converted per-interval rows.
+    This ensures the daily sheet always matches the sum of the hourly sheet.
+    """
     row = {
         "Billing run": get_billing_run(day),
         "Date":        pd.Timestamp(day),
     }
-    for api_field, col_name in DAILY_COL_MAP.items():
-        row[col_name] = float(data.get(api_field, 0) or 0)
-    # Revenue column - leave as 0 (we calculate our own in the app)
-    row["Revenue(R)"] = 0.0
+    # Map hourly column names back to daily column names
+    hourly_to_daily = {v: daily_v for (_, v), (_, daily_v)
+                       in zip(HOURLY_COL_MAP.items(), DAILY_COL_MAP.items())}
+    hourly_to_daily = {
+        "Total Solar Production Energy (kWh)": "Solar Production Energy (kWh)",
+        "Total Load Consumed Energy (kWh)":    "Load Consumed Energy (kWh)",
+        "Total Battery Charge Energy (kWh)":   "Battery Charge Energy (kWh)",
+        "Total Battery Discharge Energy (kWh)":"Battery Discharge Energy (kWh)",
+        "Total Grid Imported Energy (kWh)":    "Grid Imported Energy (kWh)",
+        "Total Grid Exported Energy (kWh)":    "Grid Exported Energy (kWh)",
+    }
+
+    # Sum all intervals for the day
+    for hourly_col, daily_col in hourly_to_daily.items():
+        total = sum(float(r.get(hourly_col, 0) or 0) for r in hourly_rows)
+        row[daily_col] = round(total, 3)
+
+    # Generator column not in hourly data — set to 0
+    row["From Generator (kWh)"] = 0.0
+    row["Revenue(R)"]           = 0.0
     return row
 
 # --- EXCEL READ / WRITE -------------------------------------------------------
@@ -238,12 +317,12 @@ def main():
             print("no data")
             continue
 
-        daily_row   = build_daily_row(day, data)
         hourly_rows = build_hourly_rows(day, data)
+        daily_row   = build_daily_row(day, hourly_rows)
 
         new_daily_rows.append(daily_row)
         new_hourly_rows.extend(hourly_rows)
-        print(f"[OK]  ({len(hourly_rows)} hourly records)")
+        print(f"[OK]  ({len(hourly_rows)} interval records)")
 
         # Wait 310 seconds (5 min 10 sec) between requests to avoid error 1201
         if i < len(dates_to_fetch) - 1:
