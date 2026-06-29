@@ -2188,12 +2188,72 @@ with tab6:
             "Battery SoC", f"{batt_soc:.0f}", "%",
             f"Inverter: {inv_temp:.1f}degC", soc_color), unsafe_allow_html=True)
 
-    # ── SECTION 2 — Gauges + Energy Flow Donut ────────────────────────────────
+    # ── SECTION 1B — Animated Sankey Energy Flow ──────────────────────────────
+    st.markdown("---")
+    st.markdown("**Live Energy Flow**")
+
+    # Calculate energy flows for Sankey
+    solar_to_load    = min(pv_kw, max(0, load_kw - batt_disc - max(0, -grid_kw)))
+    solar_to_batt    = min(pv_kw - solar_to_load, batt_charge) if batt_charge > 0 else 0
+    solar_to_grid    = max(0, pv_kw - solar_to_load - solar_to_batt)
+    grid_to_load     = max(0, grid_import - 0)
+    batt_to_load     = max(0, batt_disc)
+
+    # Only include flows > 0.05 kW to keep diagram clean
+    sankey_labels = ["Solar", "Grid", "Battery", "Load", "Grid Export"]
+    sankey_source = []
+    sankey_target = []
+    sankey_value  = []
+    sankey_colors = []
+
+    flow_map = [
+        (0, 3, solar_to_load,  "rgba(239,159,39,0.6)"),   # Solar -> Load
+        (0, 2, solar_to_batt,  "rgba(239,159,39,0.4)"),   # Solar -> Battery
+        (0, 4, solar_to_grid,  "rgba(29,158,117,0.5)"),   # Solar -> Grid Export
+        (1, 3, grid_to_load,   "rgba(127,119,221,0.6)"),  # Grid -> Load
+        (2, 3, batt_to_load,   "rgba(29,158,117,0.6)"),   # Battery -> Load
+    ]
+    for src, tgt, val, col in flow_map:
+        if val > 0.05:
+            sankey_source.append(src)
+            sankey_target.append(tgt)
+            sankey_value.append(round(val, 2))
+            sankey_colors.append(col)
+
+    if sankey_source:
+        fig_sankey = go.Figure(go.Sankey(
+            arrangement="snap",
+            node=dict(
+                pad=20, thickness=25,
+                line=dict(color="rgba(255,255,255,0.1)", width=0.5),
+                label=sankey_labels,
+                color=["#EF9F27","#7F77DD","#1D9E75","#E24B4A","#3B8BD4"],
+                x=[0.0, 0.0, 0.5, 1.0, 1.0],
+                y=[0.1, 0.7, 0.4, 0.4, 0.1],
+            ),
+            link=dict(
+                source=sankey_source,
+                target=sankey_target,
+                value=sankey_value,
+                color=sankey_colors,
+                label=[f"{v:.2f} kW" for v in sankey_value],
+            )
+        ))
+        fig_sankey.update_layout(
+            height=320,
+            margin=dict(t=20, b=20, l=20, r=20),
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="white", size=13),
+        )
+        st.plotly_chart(fig_sankey, use_container_width=True)
+    else:
+        st.info("No significant power flows to display — system may be idle.")
+
+    # ── SECTION 2 — Gauges + Donut ────────────────────────────────────────────
     st.markdown("---")
     g1, g2, g3 = st.columns(3)
 
     with g1:
-        # Battery SoC gauge
         soc_color = "#E24B4A" if batt_soc < 20 else "#EF9F27" if batt_soc < 50 else "#1D9E75"
         fig_soc_g = go.Figure(go.Indicator(
             mode="gauge+number+delta",
@@ -2216,8 +2276,7 @@ with tab6:
         st.plotly_chart(fig_soc_g, use_container_width=True)
 
     with g2:
-        # Solar performance gauge (actual vs max based on irradiance and panel capacity)
-        max_solar = 78.0  # kWp
+        max_solar = 78.0
         theoretical_kw = (irradiance / 1000) * max_solar if irradiance > 0 else max_solar
         performance_ratio = min(100, (pv_kw / theoretical_kw * 100)) if theoretical_kw > 0 else 0
         fig_perf = go.Figure(go.Indicator(
@@ -2242,29 +2301,239 @@ with tab6:
         st.caption(f"Actual: {pv_kw:.1f} kW / Theoretical: {theoretical_kw:.1f} kW at {irradiance:.0f} W/m2")
 
     with g3:
-        # Energy source donut for current load
-        solar_to_load  = min(pv_kw, load_kw)
-        batt_to_load   = min(batt_disc, max(0, load_kw - solar_to_load))
-        grid_to_load   = max(0, load_kw - solar_to_load - batt_to_load)
-        donut_vals = [solar_to_load, batt_to_load, grid_to_load]
+        solar_to_load_d  = min(pv_kw, load_kw)
+        batt_to_load_d   = min(batt_disc, max(0, load_kw - solar_to_load_d))
+        grid_to_load_d   = max(0, load_kw - solar_to_load_d - batt_to_load_d)
+        donut_vals   = [max(0,solar_to_load_d), max(0,batt_to_load_d), max(0,grid_to_load_d)]
         donut_labels = ["Solar", "Battery", "Grid"]
         donut_colors = ["#EF9F27", "#1D9E75", "#7F77DD"]
-        donut_vals_clean = [max(0, v) for v in donut_vals]
         fig_donut = go.Figure(go.Pie(
-            values=donut_vals_clean, labels=donut_labels,
+            values=donut_vals, labels=donut_labels,
             marker_colors=donut_colors,
-            hole=0.55, textinfo="percent+label",
-            textfont_size=12,
+            hole=0.55, textinfo="percent+label", textfont_size=12,
         ))
         fig_donut.update_layout(
             title="Current Load Source Mix",
             height=250, margin=dict(t=50,b=10,l=10,r=10),
-            paper_bgcolor="rgba(0,0,0,0)",
-            showlegend=False,
+            paper_bgcolor="rgba(0,0,0,0)", showlegend=False,
         )
         st.plotly_chart(fig_donut, use_container_width=True)
 
-    # ── SECTION 3 — Today's Energy + Weather side by side ────────────────────
+    # ── SECTION 3 — Peak Shaving + Live Rand Savings ──────────────────────────
+    st.markdown("---")
+    st.markdown("**Peak Shaving Effectiveness & Live Savings**")
+
+    # Current TOU slot
+    now_sa = _dt.now(_tz(_td(hours=2)))
+    _tou_now = get_tou_slot(now_sa) if 'get_tou_slot' in dir() else "1.8.2"
+    _season_now = "high" if now_sa.month in [6,7,8] else "low"
+    _tariff_now = TARIFF[_season_now][_tou_now]
+    _tou_name = {"1.8.1":"PEAK","1.8.2":"Standard","1.8.3":"Off-Peak"}[_tou_now]
+    _tou_color = {"1.8.1":"#E24B4A","1.8.2":"#EF9F27","1.8.3":"#1D9E75"}[_tou_now]
+
+    ps1, ps2, ps3, ps4 = st.columns(4)
+    ps1.markdown(f"""
+    <div style='background:{_tou_color}18;border:1px solid {_tou_color}44;
+                border-radius:12px;padding:16px;text-align:center'>
+        <div style='color:#aaa;font-size:12px'>Current TOU Slot</div>
+        <div style='color:{_tou_color};font-size:28px;font-weight:700'>{_tou_name}</div>
+        <div style='color:#888;font-size:12px'>R{_tariff_now:.4f}/kWh</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Grid avoided by battery discharge right now
+    grid_avoided_kw = batt_disc
+    rand_saved_per_hr = grid_avoided_kw * _tariff_now
+    ps2.metric("Grid Avoided Now",   f"{grid_avoided_kw:.1f} kW",
+               help="Battery discharge currently displacing grid import")
+    ps3.metric("Saving Rate",        f"R {rand_saved_per_hr:.2f}/hr",
+               help=f"At {_tou_name} tariff R{_tariff_now:.4f}/kWh")
+
+    # Estimated today's saving from battery discharge
+    daily_disc = d.get("bat_dischd", 0)
+    est_daily_saving = daily_disc * _tariff_now
+    ps4.metric("Est. Today's Saving", f"R {est_daily_saving:.2f}",
+               help="Battery discharge today × current tariff rate")
+
+    # ── SECTION 4 — Daily Forecast ────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("**Today's Production Forecast vs Actual**")
+
+    try:
+        wx_r = _requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": LAT, "longitude": LON,
+            "hourly": "shortwave_radiation",
+            "forecast_days": 1,
+            "timezone": "Africa/Johannesburg",
+        }, timeout=10)
+        wx_d = wx_r.json()
+        hours_today = wx_d["hourly"]["time"]
+        irr_today   = wx_d["hourly"]["shortwave_radiation"]
+        # Theoretical production per hour = kWp × irradiance/1000
+        theoretical_hourly = [round((i or 0) / 1000 * 78.0, 2) for i in irr_today]
+        forecast_total = sum(theoretical_hourly)
+        actual_today   = d.get("pv_daily_kwh", 0)
+
+        fig_forecast = go.Figure()
+        fig_forecast.add_bar(
+            x=hours_today, y=theoretical_hourly,
+            name="Forecast (kWh/hr)", marker_color="rgba(239,159,39,0.3)",
+        )
+        # Mark current hour
+        curr_hr_str = now_sa.strftime("%Y-%m-%dT%H:00")
+        if curr_hr_str in hours_today:
+            curr_idx = hours_today.index(curr_hr_str)
+            actual_by_hour = [0] * len(hours_today)
+            # Distribute actual evenly up to current hour as rough approximation
+            if curr_idx > 0:
+                per_hr = actual_today / curr_idx
+                for i in range(curr_idx):
+                    actual_by_hour[i] = round(per_hr, 2)
+            fig_forecast.add_bar(
+                x=hours_today[:curr_idx+1], y=actual_by_hour[:curr_idx+1],
+                name="Actual (kWh/hr)", marker_color="rgba(239,159,39,0.9)",
+            )
+        fig_forecast.add_vline(
+            x=curr_hr_str, line_dash="dash", line_color="white",
+            annotation_text="Now", annotation_position="top right"
+        )
+        fig_forecast.update_layout(
+            barmode="overlay",
+            title=f"Forecast: {forecast_total:.0f} kWh | Actual so far: {actual_today:.1f} kWh",
+            xaxis_title="Hour", yaxis_title="kWh",
+            height=320, paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend_title="",
+        )
+        fig_forecast.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+        fig_forecast.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+        st.plotly_chart(fig_forecast, use_container_width=True)
+
+        fc1, fc2, fc3 = st.columns(3)
+        fc1.metric("Forecast Total Today", f"{forecast_total:.0f} kWh")
+        fc2.metric("Actual So Far",        f"{actual_today:.1f} kWh")
+        fc3.metric("Remaining Expected",   f"{max(0, forecast_total - actual_today):.0f} kWh")
+
+    except Exception:
+        st.caption("Weather forecast unavailable.")
+
+    # ── SECTION 5 — PV String Health ─────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("**PV String Health Monitor**")
+
+    if live_data and live_data.get("pv_strings"):
+        strings = {i: v for i, v in live_data["pv_strings"].items()
+                   if abs(v["v"]) > 0.1 or abs(v["a"]) > 0.01}
+        if strings:
+            str_rows = []
+            powers = []
+            for i, sv in strings.items():
+                p = round(sv["v"] * sv["a"] / 1000, 3)
+                powers.append(p)
+                str_rows.append({
+                    "String": f"PV {i}",
+                    "Voltage (V)": round(sv["v"], 2),
+                    "Current (A)": round(sv["a"], 3),
+                    "Power (kW)":  p,
+                })
+            avg_p = sum(powers) / len(powers) if powers else 0
+            # Flag strings more than 20% below average
+            for row in str_rows:
+                if avg_p > 0.05 and row["Power (kW)"] < avg_p * 0.80:
+                    row["Status"] = "FAULT"
+                elif avg_p > 0.05:
+                    row["Status"] = "OK"
+                else:
+                    row["Status"] = "-"
+
+            str_df = pd.DataFrame(str_rows)
+
+            # Bar chart with fault highlighting
+            bar_colors = []
+            for row in str_rows:
+                if row.get("Status") == "FAULT":
+                    bar_colors.append("#E24B4A")
+                else:
+                    bar_colors.append("#EF9F27")
+
+            fig_strings = go.Figure()
+            fig_strings.add_bar(
+                x=[r["String"] for r in str_rows],
+                y=[r["Power (kW)"] for r in str_rows],
+                marker_color=bar_colors,
+                text=[f"{r['Power (kW)']:.3f} kW" for r in str_rows],
+                textposition="outside",
+            )
+            if avg_p > 0.05:
+                fig_strings.add_hline(y=avg_p, line_dash="dash", line_color="white",
+                                      annotation_text=f"Avg: {avg_p:.3f} kW")
+                fig_strings.add_hline(y=avg_p * 0.80, line_dash="dot", line_color="#E24B4A",
+                                      annotation_text="Fault threshold (80%)")
+            fig_strings.update_layout(
+                title="PV String Power Output",
+                xaxis_title="String", yaxis_title="Power (kW)",
+                height=300, paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            fig_strings.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+            fig_strings.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+            st.plotly_chart(fig_strings, use_container_width=True)
+
+            faults = [r for r in str_rows if r.get("Status") == "FAULT"]
+            if faults:
+                st.error(f"Potential fault detected on: {', '.join(r['String'] for r in faults)} "
+                         f"— producing >20% below average output.")
+            elif avg_p > 0.05:
+                st.success("All PV strings operating within normal range.")
+
+            st.dataframe(str_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No PV string data available — panels may not be generating.")
+    else:
+        st.caption("PV string data not available in current reading.")
+
+    # ── SECTION 6 — CO2 & Environmental Impact ───────────────────────────────
+    st.markdown("---")
+    st.markdown("**Environmental Impact**")
+
+    env1, env2, env3, env4 = st.columns(4)
+    co2_life  = d.get("co2_saved", 0)
+    coal_life = d.get("coal_saved", 0)
+    trees     = d.get("trees", 0)
+    pv_life   = d.get("pv_life_kwh", 0)
+
+    # Equivalent cars off road (avg car = 4.6 tons CO2/year)
+    cars_equiv = co2_life / 4.6 if co2_life > 0 else 0
+
+    env1.markdown(f"""
+    <div style='background:rgba(29,158,117,0.1);border:1px solid rgba(29,158,117,0.3);
+                border-radius:12px;padding:16px;text-align:center'>
+        <div style='font-size:32px'>🌱</div>
+        <div style='color:#1D9E75;font-size:22px;font-weight:700'>{co2_life:.1f} tons</div>
+        <div style='color:#aaa;font-size:12px'>CO2 Avoided (lifetime)</div>
+    </div>""", unsafe_allow_html=True)
+    env2.markdown(f"""
+    <div style='background:rgba(59,139,212,0.1);border:1px solid rgba(59,139,212,0.3);
+                border-radius:12px;padding:16px;text-align:center'>
+        <div style='font-size:32px'>🌳</div>
+        <div style='color:#3B8BD4;font-size:22px;font-weight:700'>{trees:.0f} trees</div>
+        <div style='color:#aaa;font-size:12px'>Equivalent Trees Planted</div>
+    </div>""", unsafe_allow_html=True)
+    env3.markdown(f"""
+    <div style='background:rgba(239,159,39,0.1);border:1px solid rgba(239,159,39,0.3);
+                border-radius:12px;padding:16px;text-align:center'>
+        <div style='font-size:32px'>🚗</div>
+        <div style='color:#EF9F27;font-size:22px;font-weight:700'>{cars_equiv:.1f}</div>
+        <div style='color:#aaa;font-size:12px'>Cars off road (equiv. year)</div>
+    </div>""", unsafe_allow_html=True)
+    env4.markdown(f"""
+    <div style='background:rgba(127,119,221,0.1);border:1px solid rgba(127,119,221,0.3);
+                border-radius:12px;padding:16px;text-align:center'>
+        <div style='font-size:32px'>⚡</div>
+        <div style='color:#7F77DD;font-size:22px;font-weight:700'>{pv_life:,.0f}</div>
+        <div style='color:#aaa;font-size:12px'>kWh Generated (lifetime)</div>
+    </div>""", unsafe_allow_html=True)
+
+    # ── SECTION 7 — Today's Energy + Weather ─────────────────────────────────
     st.markdown("---")
     en_col, wx_col = st.columns(2)
 
@@ -2275,11 +2544,7 @@ with tab6:
         e2.metric("Solar This Month",  f"{d.get('pv_month_kwh',0):.1f} kWh")
         e3, e4 = st.columns(2)
         e3.metric("Solar This Year",   f"{d.get('pv_year_kwh',0):.1f} kWh")
-        e4.metric("Lifetime Solar",    f"{d.get('pv_life_kwh',0):.1f} kWh")
-        e5, e6, e7 = st.columns(3)
-        e5.metric("Battery Discharged", f"{d.get('bat_dischd',0):.1f} kWh")
-        e6.metric("CO2 Saved",          f"{d.get('co2_saved',0):.2f} t")
-        e7.metric("Trees Equiv.",        f"{d.get('trees',0):.0f}")
+        e4.metric("Battery Discharged",f"{d.get('bat_dischd',0):.1f} kWh")
 
     with wx_col:
         st.markdown("**Current Weather — Umhlanga**")
@@ -2288,42 +2553,33 @@ with tab6:
         w2.metric("Cloud Cover",    f"{weather.get('cloud_cover',0):.0f}%")
         w3, w4 = st.columns(2)
         w3.metric("Wind Speed",     f"{weather.get('wind_speed',0):.1f} km/h")
-        w4.metric("Solar Irradiance", f"{weather.get('irradiance',0):.0f} W/m2")
-        # Mini cloud cover bar
+        w4.metric("Irradiance",     f"{weather.get('irradiance',0):.0f} W/m2")
         cloud_pct = weather.get("cloud_cover", 0)
         cloud_color = "#1D9E75" if cloud_pct < 30 else "#EF9F27" if cloud_pct < 70 else "#7F77DD"
         st.markdown(f"""
-        <div style='margin-top:10px'>
-            <div style='font-size:12px;color:#aaa;margin-bottom:4px'>Cloud cover impact on solar</div>
-            <div style='background:#222;border-radius:6px;height:14px;width:100%'>
-                <div style='background:{cloud_color};height:14px;width:{cloud_pct}%;
-                            border-radius:6px;transition:width 0.5s'></div>
+        <div style='margin-top:8px'>
+            <div style='font-size:12px;color:#aaa;margin-bottom:4px'>Cloud cover solar impact</div>
+            <div style='background:#222;border-radius:6px;height:12px;width:100%'>
+                <div style='background:{cloud_color};height:12px;width:{cloud_pct}%;
+                            border-radius:6px'></div>
             </div>
-            <div style='font-size:11px;color:#888;margin-top:3px'>
-                Estimated solar reduction: {cloud_pct:.0f}%
+            <div style='font-size:11px;color:#888;margin-top:2px'>
+                Est. solar reduction: {cloud_pct:.0f}%
             </div>
-        </div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
 
-    # ── SECTION 4 — Inverter Details ──────────────────────────────────────────
+    # ── SECTION 8 — Inverter Details (collapsed) ──────────────────────────────
     st.markdown("---")
-    with st.expander("Inverter & PV String Details", expanded=False):
+    with st.expander("Inverter & Grid Details", expanded=False):
         inv1, inv2, inv3, inv4 = st.columns(4)
-        inv1.metric("PV Power",        f"{d.get('inv_pv_kw',0):.2f} kW")
-        inv2.metric("Inverter Temp",   f"{d.get('inv_temp',0):.1f} degC")
-        inv3.metric("Power Factor",    f"{live_data.get('power_factor',0):.3f}" if live_data else "—")
-        inv4.metric("Grid Frequency",  f"{live_data.get('grid_freq',0):.2f} Hz" if live_data else "—")
-
-        if live_data and live_data.get("pv_strings"):
-            st.markdown("**PV Strings**")
-            str_rows = []
-            for i, sv in live_data["pv_strings"].items():
-                v, a = sv["v"], sv["a"]
-                if abs(v) > 0.1 or abs(a) > 0.01:
-                    str_rows.append({"String": f"PV {i}", "Voltage (V)": round(v,2),
-                                     "Current (A)": round(a,3), "Power (kW)": round(v*a/1000,3)})
-            if str_rows:
-                st.dataframe(pd.DataFrame(str_rows), use_container_width=True, hide_index=True)
+        inv1.metric("PV Power",       f"{d.get('inv_pv_kw',0):.2f} kW")
+        inv2.metric("Inverter Temp",  f"{d.get('inv_temp',0):.1f} degC",
+                    delta="High" if d.get('inv_temp',0) > 60 else "Normal",
+                    delta_color="inverse" if d.get('inv_temp',0) > 60 else "off")
+        inv3.metric("Power Factor",   f"{live_data.get('power_factor',0):.3f}" if live_data else "—")
+        inv4.metric("Grid Frequency", f"{live_data.get('grid_freq',0):.2f} Hz" if live_data else "—",
+                    delta="OK" if live_data and 49.5 <= live_data.get('grid_freq',50) <= 50.5 else "Out of range",
+                    delta_color="off" if live_data and 49.5 <= live_data.get('grid_freq',50) <= 50.5 else "inverse")
 
         if live_data and live_data.get("phases"):
             st.markdown("**Grid Phases**")
@@ -2334,7 +2590,7 @@ with tab6:
                        for ph in ["a","b","c"]]
             st.dataframe(pd.DataFrame(ph_rows), use_container_width=True, hide_index=True)
 
-    # ── SECTION 5 — 7-day trend charts ───────────────────────────────────────
+    # ── SECTION 9 — 7-day trends ──────────────────────────────────────────────
     st.markdown("---")
     st.markdown("**Last 7 Days — Power & Weather Trends**")
 
