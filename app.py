@@ -319,8 +319,41 @@ with st.sidebar:
 with st.spinner("Loading data..."):
     daily, hourly = load_data(DATA_FILE)
 
-billing_runs = daily.groupby("billing_run")["date"].max().to_dict()
-billing_runs = {k: pd.Timestamp(v) for k, v in billing_runs.items()}
+# ── Billing runs from JSON config ──────────────────────────────────────────────
+import json as _json
+
+def load_billing_runs_config() -> dict:
+    """
+    Load billing run schedule from billing_runs.json.
+    Returns dict of {run_name: end_date as pd.Timestamp} sorted chronologically.
+    Falls back to grouping by billing_run column if JSON not found.
+    """
+    config_path = Path(DATA_FILE).parent / "billing_runs.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            data = _json.load(f)
+        runs = sorted(data["billing_runs"], key=lambda r: r["end_date"])
+        return {r["name"]: pd.Timestamp(r["end_date"]) for r in runs}
+    else:
+        # Fallback: derive from data
+        st.warning("billing_runs.json not found — using dates from data. Add billing_runs.json for accurate billing periods.")
+        runs = daily.groupby("billing_run")["date"].max().to_dict()
+        return {k: pd.Timestamp(v) for k, v in runs.items()}
+
+billing_runs = load_billing_runs_config()
+
+# Re-assign billing_run column in daily data using the JSON config
+# so sorting and grouping is always correct
+def assign_billing_run(d: pd.Timestamp, runs: dict) -> str:
+    """Assign a date to the correct billing run based on end dates."""
+    d_date = d.date() if hasattr(d, "date") else d
+    for run_name, end_date in sorted(runs.items(), key=lambda x: x[1]):
+        if pd.Timestamp(d_date) <= end_date:
+            return run_name
+    return "Pending"
+
+daily["billing_run"] = daily["date"].apply(lambda d: assign_billing_run(d, billing_runs))
+daily = daily.sort_values("date").reset_index(drop=True)
 
 # ─── TARIFF CONSTANTS ─────────────────────────────────────────────────────────
 TARIFF = {

@@ -1,0 +1,17 @@
+{
+  "billing_runs": [
+    {"name": "Jan 2026",      "end_date": "2026-01-09"},
+    {"name": "Feb 2026",      "end_date": "2026-02-06"},
+    {"name": "Mar 2026",      "end_date": "2026-03-13"},
+    {"name": "Apr 2026",      "end_date": "2026-04-17"},
+    {"name": "May 2026",      "end_date": "2026-05-15"},
+    {"name": "June 2026",     "end_date": "2026-06-12"},
+    {"name": "July 2026",     "end_date": "2026-07-10"},
+    {"name": "August 2026",   "end_date": "2026-08-07"},
+    {"name": "September 2026","end_date": "2026-09-07"},
+    {"name": "October 2026",  "end_date": "2026-10-09"},
+    {"name": "November 2026", "end_date": "2026-11-06"},
+    {"name": "December 2026", "end_date": "2026-12-07"}
+  ],
+  "_note": "Add new billing runs here as end dates are confirmed. Format: YYYY-MM-DD. Each run starts the day after the previous one ends. Dates before the first run (5 Dec 2025) belong to Jan 2026."
+}
