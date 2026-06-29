@@ -1904,11 +1904,18 @@ with tab6:
     st.caption("Real-time power flow from Sigenergy API, overlaid with weather data from Open-Meteo.")
 
     # ── Config ────────────────────────────────────────────────────────────────
-    LIVE_API_BASE  = os.getenv("SIGEN_API_BASE", "https://openapi-eu.sigencloud.com")
-    LIVE_SYSTEM_ID = os.getenv("SIGEN_SYSTEM_ID", "HUCUD1764140703")
-    LIVE_USERNAME  = os.getenv("SIGEN_USERNAME")
-    LIVE_PASSWORD  = os.getenv("SIGEN_PASSWORD")
-    LIVE_INVERTER_SN = os.getenv("SIGEN_INVERTER_SN", "110B1K500388")
+    # Load credentials from st.secrets (Streamlit Cloud) or os.getenv (local .env)
+    def _get_secret(key, default=None):
+        try:
+            return st.secrets[key]
+        except Exception:
+            return os.getenv(key, default)
+
+    LIVE_API_BASE    = _get_secret("SIGEN_API_BASE", "https://openapi-eu.sigencloud.com")
+    LIVE_SYSTEM_ID   = _get_secret("SIGEN_SYSTEM_ID", "HUCUD1764140703")
+    LIVE_USERNAME    = _get_secret("SIGEN_USERNAME")
+    LIVE_PASSWORD    = _get_secret("SIGEN_PASSWORD")
+    LIVE_INVERTER_SN = _get_secret("SIGEN_INVERTER_SN", "110B1K500388")
 
     # Umhlanga coordinates for weather
     LAT, LON = -29.7215, 31.0498
