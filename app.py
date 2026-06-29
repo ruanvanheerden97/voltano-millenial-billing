@@ -1897,6 +1897,7 @@ with tab5:
 with tab6:
     import requests as _requests
     import sqlite3
+    import json as _json_live
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
     st.subheader("Live System Dashboard")
@@ -1967,7 +1968,7 @@ with tab6:
         body = r.json()
         if body.get("code") != 0:
             return None
-        data = json.loads(body["data"]) if isinstance(body["data"], str) else body["data"]
+        data = _json_live.loads(body["data"]) if isinstance(body["data"], str) else body["data"]
         return data["accessToken"]
 
     def fetch_energy_flow(token):
@@ -1982,7 +1983,7 @@ with tab6:
             return None
         data = body.get("data", {})
         if isinstance(data, str):
-            data = json.loads(data)
+            data = _json_live.loads(data)
         return data
 
     def fetch_system_summary(token):
@@ -1997,7 +1998,7 @@ with tab6:
             return None
         data = body.get("data", {})
         if isinstance(data, str):
-            data = json.loads(data)
+            data = _json_live.loads(data)
         return data
 
     def fetch_device_realtime(token, serial_number):
@@ -2012,7 +2013,7 @@ with tab6:
             return None
         data = body.get("data", {})
         if isinstance(data, str):
-            data = json.loads(data)
+            data = _json_live.loads(data)
         return data.get("realTimeInfo", data)
 
     def fetch_weather():
