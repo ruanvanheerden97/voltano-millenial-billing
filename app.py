@@ -328,8 +328,8 @@ def load_billing_runs_config() -> dict:
     Returns dict of {run_name: end_date as pd.Timestamp} sorted chronologically.
     Falls back to grouping by billing_run column if JSON not found.
     """
-    config_path = Path(DATA_FILE).parent / "billing_runs.json"
-    if config_path.exists():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "billing_runs.json")
+    if os.path.exists(config_path):
         with open(config_path) as f:
             data = _json.load(f)
         runs = sorted(data["billing_runs"], key=lambda r: r["end_date"])
