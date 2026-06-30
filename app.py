@@ -1950,48 +1950,86 @@ with tab6:
     # ── DB path (shared with live_logger.py on the Pi) ────────────────────────
     DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_readings.db")
 
+    # ── CSV fallback paths ─────────────────────────────────────────────────────
+    # When this app runs on Streamlit Cloud, it has no access to the Pi's
+    # local live_readings.db at all - that file only exists on the Pi's disk.
+    # hourly_export_push.sh (cron, on the Pi) exports the DB to these two CSVs
+    # and pushes them to GitHub every hour, so Streamlit Cloud can show
+    # reasonably fresh (up to ~1hr old) data instead of nothing. The Pi-hosted
+    # version of this app always prefers the live DB (true 5-min freshness)
+    # and only falls back to CSV if the DB is genuinely missing.
+    LATEST_CSV_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_latest.csv")
+    HISTORY_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_history.csv")
+
     # ── Read-only DB helpers ───────────────────────────────────────────────────
     # NOTE: This tab does NOT call the Sigenergy API directly. live_logger.py
     # runs on the Pi via cron every 5 minutes (matching the documented API
     # rate limit of "one access per station/device every 5 minutes" which
     # applies identically to /energyFlow, /summary, and /devices/.../realtimeInfo).
-    # This tab only ever reads from live_readings.db, so the dashboard can be
-    # auto-refreshed as often as you like (e.g. every 30s during a demo)
-    # without ever risking error 1201 (Access restriction).
+    # This tab only ever reads from live_readings.db (or its CSV export as a
+    # fallback), so the dashboard can be auto-refreshed as often as you like
+    # (e.g. every 30s during a demo) without ever risking error 1201.
 
     def load_latest() -> dict:
-        """Return the most recent reading from the DB as a dict, or {} if
-        the DB doesn't exist yet or has no rows."""
-        if not os.path.exists(DB_PATH):
-            return {}
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            row = conn.execute(
-                "SELECT * FROM live_readings ORDER BY ts DESC LIMIT 1"
-            ).fetchone()
-            cols = [d[0] for d in conn.execute("SELECT * FROM live_readings LIMIT 0").description] if row else []
-            conn.close()
-            if row:
-                return dict(zip(cols, row))
-        except Exception:
-            pass
+        """Return the most recent reading as a dict. Tries live_readings.db
+        first (true real-time, available on the Pi); falls back to
+        live_latest.csv (up to ~1hr old, available wherever GitHub synced it,
+        e.g. Streamlit Cloud) if the DB doesn't exist. Returns {} if neither
+        source is available."""
+        if os.path.exists(DB_PATH):
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute(
+                    "SELECT * FROM live_readings ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+                cols = [d[0] for d in conn.execute("SELECT * FROM live_readings LIMIT 0").description] if row else []
+                conn.close()
+                if row:
+                    return dict(zip(cols, row))
+            except Exception:
+                pass
+
+        # Fallback: CSV export (Streamlit Cloud scenario)
+        if os.path.exists(LATEST_CSV_PATH):
+            try:
+                df = pd.read_csv(LATEST_CSV_PATH)
+                if len(df) > 0:
+                    return df.iloc[0].to_dict()
+            except Exception:
+                pass
+
         return {}
 
     def load_history(days=7) -> pd.DataFrame:
-        """Return all readings from the last `days` days, oldest first."""
-        if not os.path.exists(DB_PATH):
-            return pd.DataFrame()
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
-            df = pd.read_sql(
-                "SELECT * FROM live_readings WHERE ts >= ? ORDER BY ts",
-                conn, params=(cutoff,)
-            )
-            conn.close()
-            return df
-        except Exception:
-            return pd.DataFrame()
+        """Return readings from the last `days` days, oldest first. Same
+        DB-first, CSV-fallback pattern as load_latest()."""
+        if os.path.exists(DB_PATH):
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
+                df = pd.read_sql(
+                    "SELECT * FROM live_readings WHERE ts >= ? ORDER BY ts",
+                    conn, params=(cutoff,)
+                )
+                conn.close()
+                return df
+            except Exception:
+                pass
+
+        # Fallback: CSV export (Streamlit Cloud scenario). Already filtered
+        # to 7 days by export_live_csv.py, but re-filter here in case `days`
+        # differs from that script's default.
+        if os.path.exists(HISTORY_CSV_PATH):
+            try:
+                df = pd.read_csv(HISTORY_CSV_PATH)
+                if "ts" in df.columns and len(df) > 0:
+                    cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
+                    df = df[df["ts"] >= cutoff].sort_values("ts")
+                return df
+            except Exception:
+                pass
+
+        return pd.DataFrame()
 
     # ── Load latest reading from DB ────────────────────────────────────────────
     d = load_latest()
