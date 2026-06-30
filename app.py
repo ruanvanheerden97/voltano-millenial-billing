@@ -2375,9 +2375,35 @@ with tab6:
     st.markdown("---")
     st.markdown("**PV String Health Monitor**")
 
+    # Detect inverters where the ENTIRE device fetch likely failed (all 4
+    # strings AND pv_kw are exactly 0) vs. genuinely idle/disconnected
+    # strings on an inverter that otherwise reported real data. A failed
+    # fetch defaults every field to 0 via .get(..., 0), which is a different
+    # situation from a string that's truly producing nothing.
+    _missing_inverters = []
+    for inv in range(1, 4):
+        _inv_pv_kw = d.get(f"inv{inv}_pv_kw", 0)
+        _inv_strings_all_zero = all(
+            d.get(f"inv{inv}_pv{s}_v", 0) == 0 and d.get(f"inv{inv}_pv{s}_a", 0) == 0
+            for s in range(1, 5)
+        )
+        if _inv_pv_kw == 0 and _inv_strings_all_zero:
+            _missing_inverters.append(inv)
+
+    if _missing_inverters:
+        _names = ", ".join(f"Inverter {i}" for i in _missing_inverters)
+        st.warning(
+            f"{_names} reported no data on the last logger run (likely a "
+            f"transient API timeout/error - live_logger.py retries automatically, "
+            f"so this should resolve on the next 5-minute cycle). Strings for "
+            f"{'this inverter' if len(_missing_inverters)==1 else 'these inverters'} "
+            f"are hidden below rather than shown as disconnected."
+        )
+
     if live_data and live_data.get("pv_strings"):
         strings = {i: v for i, v in live_data["pv_strings"].items()
-                   if abs(v["v"]) > 0.1 or abs(v["a"]) > 0.01}
+                   if (abs(v["v"]) > 0.1 or abs(v["a"]) > 0.01)
+                   and int(i.split("-")[0]) not in _missing_inverters}
         if strings:
             str_rows = []
             powers = []

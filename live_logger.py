@@ -30,6 +30,7 @@ endpoint (also 5-min limited, but on its own schedule via cron).
 import os
 import json
 import sqlite3
+import time
 import requests
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -191,7 +192,7 @@ def get_token() -> str:
     r = requests.post(
         f"{API_BASE}/openapi/auth/login/password",
         json={"username": USERNAME, "password": PASSWORD},
-        timeout=10
+        timeout=15
     )
     body = r.json()
     if body.get("code") != 0:
@@ -201,13 +202,38 @@ def get_token() -> str:
         d = json.loads(d)
     return d["accessToken"]
 
-def api_get(token: str, path: str) -> dict | None:
-    r = requests.get(
-        f"{API_BASE}{path}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10
-    )
-    body = r.json()
+def api_get(token: str, path: str, retry_on_failure: bool = True) -> dict | None:
+    """GET a Sigenergy endpoint. Retries once after a short pause if the
+    request times out OR if the response body is empty/malformed (observed
+    in practice: occasionally a device returns an empty body that fails to
+    parse as JSON, distinct from a proper error response with a code field).
+    """
+    try:
+        r = requests.get(
+            f"{API_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15
+        )
+    except requests.exceptions.Timeout:
+        if retry_on_failure:
+            print(f"    [api_get]  {path} -> timeout, retrying once...")
+            time.sleep(3)
+            return api_get(token, path, retry_on_failure=False)
+        print(f"    [api_get]  {path} -> timed out again on retry, giving up.")
+        return None
+
+    try:
+        body = r.json()
+    except json.JSONDecodeError:
+        if retry_on_failure:
+            print(f"    [api_get]  {path} -> empty/invalid response body "
+                  f"(status {r.status_code}), retrying once...")
+            time.sleep(3)
+            return api_get(token, path, retry_on_failure=False)
+        print(f"    [api_get]  {path} -> empty/invalid response body again "
+              f"on retry (status {r.status_code}), giving up.")
+        return None
+
     if body.get("code") != 0:
         print(f"    [api_get]  {path} -> code={body.get('code')} msg={body.get('msg')}")
         return None
