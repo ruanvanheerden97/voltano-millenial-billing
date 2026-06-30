@@ -48,8 +48,13 @@ TARIFF    = TOU_PERIODS[-1]["tariffs_rkwh"]
 SELL_RATE = TOU_PERIODS[-1]["sell_rate_rkwh"]
 
 def get_period_for_date(dt) -> dict:
-    """Return the tariff period dict that was in effect on the given date."""
+    """Return the tariff period dict that was in effect on the given date.
+    Strips timezone info before comparing, since _TOU_PERIOD_STARTS are
+    timezone-naive (parsed from plain date strings in tou_tariffs.json),
+    while callers like the live dashboard may pass timezone-aware datetimes."""
     d = pd.Timestamp(dt)
+    if d.tzinfo is not None:
+        d = d.tz_localize(None)
     idx = _bisect_tou.bisect_right(_TOU_PERIOD_STARTS, d) - 1
     idx = max(0, min(idx, len(TOU_PERIODS) - 1))
     return TOU_PERIODS[idx]
