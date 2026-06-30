@@ -2209,9 +2209,17 @@ with tab6:
     solar_to_batt    = min(pv_kw - solar_to_load, batt_charge) if batt_charge > 0 else 0
     solar_to_grid    = max(0, pv_kw - solar_to_load - solar_to_batt)
     grid_to_load     = max(0, grid_import - 0)
+    grid_to_batt     = max(0, batt_charge - solar_to_batt)
     batt_to_load     = max(0, batt_disc)
 
-    # Only include flows > 0.05 kW to keep diagram clean
+    # 3-column layout matching the Sigenergy portal's own energy flow diagram:
+    #   Left column   (sources):      Solar, Grid
+    #   Middle column  (always Battery, whether charging or discharging):
+    #   Right column  (destinations): Load, Grid Export
+    # Battery sits in a TRUE middle column regardless of charge/discharge
+    # state - it always both receives (from Solar/Grid when charging) and
+    # sends (to Load when discharging) so it never collapses into a thin
+    # pass-through or gets pinned to an edge it doesn't belong on.
     sankey_labels = ["Solar", "Grid", "Battery", "Load", "Grid Export"]
     sankey_source = []
     sankey_target = []
@@ -2219,11 +2227,12 @@ with tab6:
     sankey_colors = []
 
     flow_map = [
-        (0, 3, solar_to_load,  "rgba(239,159,39,0.6)"),   # Solar -> Load
-        (0, 2, solar_to_batt,  "rgba(239,159,39,0.4)"),   # Solar -> Battery
-        (0, 4, solar_to_grid,  "rgba(29,158,117,0.5)"),   # Solar -> Grid Export
-        (1, 3, grid_to_load,   "rgba(127,119,221,0.6)"),  # Grid -> Load
-        (2, 3, batt_to_load,   "rgba(29,158,117,0.6)"),   # Battery -> Load
+        (0, 3, solar_to_load,  "rgba(239,159,39,0.6)"),   # Solar -> Load (direct, bypasses battery)
+        (0, 2, solar_to_batt,  "rgba(239,159,39,0.4)"),   # Solar -> Battery (charging)
+        (0, 4, solar_to_grid,  "rgba(239,159,39,0.5)"),   # Solar -> Grid Export
+        (1, 3, grid_to_load,   "rgba(127,119,221,0.6)"),  # Grid -> Load (direct, bypasses battery)
+        (1, 2, grid_to_batt,   "rgba(127,119,221,0.4)"),  # Grid -> Battery (charging from grid)
+        (2, 3, batt_to_load,   "rgba(29,158,117,0.6)"),   # Battery -> Load (discharging)
     ]
     for src, tgt, val, col in flow_map:
         if val > 0.05:
@@ -2240,8 +2249,11 @@ with tab6:
                 line=dict(color="rgba(255,255,255,0.1)", width=0.5),
                 label=sankey_labels,
                 color=["#EF9F27","#7F77DD","#1D9E75","#E24B4A","#3B8BD4"],
+                # True 3-column layout: x=0 (sources), x=0.5 (battery, always
+                # middle), x=1.0 (destinations) - matches the Sigenergy
+                # portal's own Energy Statistics diagram structure.
                 x=[0.0, 0.0, 0.5, 1.0, 1.0],
-                y=[0.1, 0.7, 0.4, 0.4, 0.1],
+                y=[0.1, 0.7, 0.4, 0.3, 0.7],
             ),
             link=dict(
                 source=sankey_source,
