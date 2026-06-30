@@ -1940,83 +1940,47 @@ with tab5:
 with tab6:
     import requests as _requests
     import sqlite3
-    import json as _json_live
-    import time as _time
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
-    # ── Credentials (Streamlit Cloud secrets or local .env) ───────────────────
-    def _get_secret(key, default=None):
-        try:
-            return st.secrets[key]
-        except Exception:
-            return os.getenv(key, default)
+    # Umhlanga coordinates - used only for the free Open-Meteo forecast call
+    # below (Section 4). This is NOT the Sigenergy API and has no meaningful
+    # rate limit, so it's fine to call directly on every tab render.
+    LAT, LON = -29.7215, 31.0498
 
-    LIVE_API_BASE    = _get_secret("SIGEN_API_BASE", "https://openapi-eu.sigencloud.com")
-    LIVE_SYSTEM_ID   = _get_secret("SIGEN_SYSTEM_ID", "HUCUD1764140703")
-    LIVE_USERNAME    = _get_secret("SIGEN_USERNAME")
-    LIVE_PASSWORD    = _get_secret("SIGEN_PASSWORD")
-    LIVE_INVERTER_SN = _get_secret("SIGEN_INVERTER_SN", "110B1K500388")
-    LAT, LON         = -29.7215, 31.0498
-    DB_PATH          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_readings.db")
+    # ── DB path (shared with live_logger.py on the Pi) ────────────────────────
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_readings.db")
 
-    # ── SQLite ────────────────────────────────────────────────────────────────
-    def init_db():
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS live_readings (
-                ts           TEXT PRIMARY KEY,
-                pv_kw        REAL, grid_kw      REAL,
-                load_kw      REAL, battery_kw   REAL,
-                battery_soc  REAL, cloud_cover  REAL,
-                irradiance   REAL, temperature  REAL,
-                pv_daily_kwh REAL, pv_month_kwh REAL,
-                pv_year_kwh  REAL, pv_life_kwh  REAL,
-                inv_temp     REAL, inv_pv_kw    REAL,
-                bat_dischd   REAL, co2_saved    REAL,
-                coal_saved   REAL, trees        REAL
-            )
-        """)
-        conn.commit(); conn.close()
-
-    def save_reading(ts, data: dict):
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
-            INSERT OR REPLACE INTO live_readings VALUES
-            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            ts,
-            data.get("pv_kw", 0),       data.get("grid_kw", 0),
-            data.get("load_kw", 0),      data.get("battery_kw", 0),
-            data.get("battery_soc", 0),  data.get("cloud_cover", 0),
-            data.get("irradiance", 0),   data.get("temperature", 0),
-            data.get("pv_daily_kwh", 0), data.get("pv_month_kwh", 0),
-            data.get("pv_year_kwh", 0),  data.get("pv_life_kwh", 0),
-            data.get("inv_temp", 0),     data.get("inv_pv_kw", 0),
-            data.get("bat_dischd", 0),   data.get("co2_saved", 0),
-            data.get("coal_saved", 0),   data.get("trees", 0),
-        ))
-        conn.commit(); conn.close()
+    # ── Read-only DB helpers ───────────────────────────────────────────────────
+    # NOTE: This tab does NOT call the Sigenergy API directly. live_logger.py
+    # runs on the Pi via cron every 5 minutes (matching the documented API
+    # rate limit of "one access per station/device every 5 minutes" which
+    # applies identically to /energyFlow, /summary, and /devices/.../realtimeInfo).
+    # This tab only ever reads from live_readings.db, so the dashboard can be
+    # auto-refreshed as often as you like (e.g. every 30s during a demo)
+    # without ever risking error 1201 (Access restriction).
 
     def load_latest() -> dict:
-        """Return the most recent reading from DB as a dict."""
+        """Return the most recent reading from the DB as a dict, or {} if
+        the DB doesn't exist yet or has no rows."""
+        if not os.path.exists(DB_PATH):
+            return {}
         try:
             conn = sqlite3.connect(DB_PATH)
             row = conn.execute(
                 "SELECT * FROM live_readings ORDER BY ts DESC LIMIT 1"
             ).fetchone()
+            cols = [d[0] for d in conn.execute("SELECT * FROM live_readings LIMIT 0").description] if row else []
             conn.close()
             if row:
-                cols = ["ts","pv_kw","grid_kw","load_kw","battery_kw",
-                        "battery_soc","cloud_cover","irradiance","temperature",
-                        "pv_daily_kwh","pv_month_kwh","pv_year_kwh","pv_life_kwh",
-                        "inv_temp","inv_pv_kw","bat_dischd","co2_saved",
-                        "coal_saved","trees"]
                 return dict(zip(cols, row))
         except Exception:
             pass
         return {}
 
     def load_history(days=7) -> pd.DataFrame:
+        """Return all readings from the last `days` days, oldest first."""
+        if not os.path.exists(DB_PATH):
+            return pd.DataFrame()
         try:
             conn = sqlite3.connect(DB_PATH)
             cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
@@ -2029,130 +1993,74 @@ with tab6:
         except Exception:
             return pd.DataFrame()
 
-    init_db()
+    # ── Load latest reading from DB ────────────────────────────────────────────
+    d = load_latest()
 
-    # ── API helpers ───────────────────────────────────────────────────────────
-    @st.cache_data(ttl=280)
-    def get_live_token():
-        r = _requests.post(
-            f"{LIVE_API_BASE}/openapi/auth/login/password",
-            json={"username": LIVE_USERNAME, "password": LIVE_PASSWORD}, timeout=10
-        )
-        body = r.json()
-        if body.get("code") != 0: return None
-        d = body["data"]
-        if isinstance(d, str): d = _json_live.loads(d)
-        return d["accessToken"]
-
-    def _api_get(token, path):
-        r = _requests.get(f"{LIVE_API_BASE}{path}",
-                          headers={"Authorization": f"Bearer {token}"}, timeout=10)
-        body = r.json()
-        if body.get("code") != 0: return None
-        d = body.get("data", {})
-        return _json_live.loads(d) if isinstance(d, str) else d
-
-    def fetch_all_live():
-        """Fetch all live data and return a unified dict. Returns None on failure."""
+    data_fresh = False
+    reading_age_seconds = None
+    if d and d.get("ts"):
         try:
-            token = get_live_token()
-            if not token: return None
-
-            flow    = _api_get(token, f"/openapi/systems/{LIVE_SYSTEM_ID}/energyFlow")
-            summary = _api_get(token, f"/openapi/systems/{LIVE_SYSTEM_ID}/summary")
-            dev_raw = _api_get(token, f"/openapi/systems/{LIVE_SYSTEM_ID}/devices/{LIVE_INVERTER_SN}/realtimeInfo")
-            dev = dev_raw.get("realTimeInfo", dev_raw) if dev_raw else {}
-
-            if not flow: return None
-
-            pv_kw   = float(flow.get("pvPower", 0) or 0)
-            grid_kw = float(flow.get("gridPower", 0) or 0)
-            load_kw = float(flow.get("loadPower", 0) or 0)
-            batt_kw = float(flow.get("batteryPower", 0) or 0)
-            batt_soc= float(flow.get("batterySoc", 0) or 0)
-
-            return {
-                "pv_kw":        pv_kw,
-                "grid_kw":      grid_kw,
-                "load_kw":      load_kw,
-                "battery_kw":   batt_kw,
-                "battery_soc":  batt_soc,
-                "pv_daily_kwh": float(summary.get("dailyPowerGeneration", 0) or 0) if summary else 0,
-                "pv_month_kwh": float(summary.get("monthlyPowerGeneration", 0) or 0) if summary else 0,
-                "pv_year_kwh":  float(summary.get("annualPowerGeneration", 0) or 0) if summary else 0,
-                "pv_life_kwh":  float(summary.get("lifetimePowerGeneration", 0) or 0) if summary else 0,
-                "co2_saved":    float(summary.get("lifetimeCo2", 0) or 0) if summary else 0,
-                "coal_saved":   float(summary.get("lifetimeCoal", 0) or 0) if summary else 0,
-                "trees":        float(summary.get("lifetimeTreeEquivalent", 0) or 0) if summary else 0,
-                "inv_temp":     float(dev.get("internalTemperature", 0) or 0),
-                "inv_pv_kw":    float(dev.get("pvTotalPower", 0) or 0),
-                "bat_dischd":   float(dev.get("esDischargingDay", 0) or 0),
-                "pv_strings":   {i: {
-                    "v": float(dev.get(f"pv{i}Voltage", 0) or 0),
-                    "a": float(dev.get(f"pv{i}Current", 0) or 0),
-                } for i in range(1, 5)},
-                "phases": {ph: {
-                    "v": float(dev.get(f"{ph}PhaseVoltage", 0) or 0),
-                    "a": float(dev.get(f"{ph}PhaseCurrent", 0) or 0),
-                } for ph in ["a","b","c"]},
-                "power_factor": float(dev.get("powerFactor", 0) or 0),
-                "grid_freq":    float(dev.get("gridFrequency", 0) or 0),
-            }
+            reading_ts = pd.Timestamp(d["ts"])
+            if reading_ts.tzinfo is None:
+                reading_ts = reading_ts.tz_localize("UTC")
+            reading_age_seconds = (pd.Timestamp.now(tz="UTC") - reading_ts).total_seconds()
+            # "Fresh" = logged within the last 10 minutes (allows for the 5-min
+            # cron interval plus a bit of slack for a slow run or cron drift)
+            data_fresh = reading_age_seconds < 600
         except Exception:
-            return None
+            data_fresh = False
 
-    def fetch_weather():
-        try:
-            r = _requests.get("https://api.open-meteo.com/v1/forecast", params={
-                "latitude": LAT, "longitude": LON,
-                "current":  "temperature_2m,cloud_cover,wind_speed_10m,precipitation",
-                "hourly":   "shortwave_radiation,cloud_cover,temperature_2m",
-                "forecast_days": 1, "timezone": "Africa/Johannesburg",
-            }, timeout=10)
-            d = r.json()
-            curr = d.get("current", {})
-            now_hour = _dt.now().strftime("%Y-%m-%dT%H:00")
-            times = d.get("hourly", {}).get("time", [])
-            irr = d["hourly"]["shortwave_radiation"][times.index(now_hour)] if now_hour in times else 0
-            return {
-                "temperature": curr.get("temperature_2m", 0),
-                "cloud_cover": curr.get("cloud_cover", 0),
-                "wind_speed":  curr.get("wind_speed_10m", 0),
-                "precipitation": curr.get("precipitation", 0),
-                "irradiance":  irr or 0,
-            }
-        except Exception:
-            return {}
+    # Reconstruct nested structures the rest of this tab expects, from the
+    # flat columns live_logger.py writes.
+    live_data = None
+    if d:
+        live_data = {
+            "pv_strings": {
+                f"{inv}-{s}": {"v": d.get(f"inv{inv}_pv{s}_v", 0), "a": d.get(f"inv{inv}_pv{s}_a", 0)}
+                for inv in range(1, 4) for s in range(1, 5)
+            },
+            "phases": {ph: {"v": d.get(f"phase_{ph}_v", 0), "a": d.get(f"phase_{ph}_a", 0)} for ph in ["a", "b", "c"]},
+            "power_factor": d.get("power_factor", 0),
+            "grid_freq": d.get("grid_freq", 0),
+            "inv_temps": [d.get(f"inv{i}_temp", 0) for i in range(1, 4)],
+        }
 
-    # ── Fetch data — fallback to cached if API fails ──────────────────────────
-    live_data = fetch_all_live()
-    weather   = fetch_weather()
-    data_fresh = live_data is not None
-
-    if live_data:
-        ts = _dt.now(_tz.utc).isoformat()
-        live_data.update({
-            "cloud_cover": weather.get("cloud_cover", 0),
-            "irradiance":  weather.get("irradiance", 0),
-            "temperature": weather.get("temperature", 0),
-        })
-        save_reading(ts, live_data)
-        d = live_data
-    else:
-        d = load_latest()
+    weather = {
+        "temperature":   d.get("temperature", 0),
+        "cloud_cover":   d.get("cloud_cover", 0),
+        "wind_speed":    d.get("wind_speed", 0),
+        "precipitation": d.get("precipitation", 0),
+        "irradiance":    d.get("irradiance", 0),
+    } if d else {}
 
     # ── Header ────────────────────────────────────────────────────────────────
     hdr_left, hdr_right = st.columns([3, 1])
     with hdr_left:
         st.subheader("Live System Dashboard — The Millennial")
         if data_fresh:
-            st.caption(f"Live data as of {_dt.now(_tz(_td(hours=2))).strftime('%d %b %Y %H:%M:%S')} SAST")
+            reading_ts_local = pd.Timestamp(d["ts"])
+            if reading_ts_local.tzinfo is None:
+                reading_ts_local = reading_ts_local.tz_localize("UTC")
+            reading_ts_local = reading_ts_local.tz_convert("Africa/Johannesburg")
+            st.caption(f"Last reading: {reading_ts_local.strftime('%d %b %Y %H:%M:%S')} SAST "
+                       f"(updates every 5 min)")
         elif d:
-            cached_ts = pd.Timestamp(d.get("ts","")).tz_convert("Africa/Johannesburg")
-            st.caption(f"API unavailable — showing last known data from {cached_ts.strftime('%d %b %Y %H:%M')} SAST")
-            st.warning("Live API unreachable — displaying cached data.")
+            reading_ts_local = pd.Timestamp(d["ts"])
+            if reading_ts_local.tzinfo is None:
+                reading_ts_local = reading_ts_local.tz_localize("UTC")
+            reading_ts_local = reading_ts_local.tz_convert("Africa/Johannesburg")
+            age_min = int(reading_age_seconds // 60) if reading_age_seconds else 0
+            st.caption(f"Last reading: {reading_ts_local.strftime('%d %b %Y %H:%M:%S')} SAST "
+                       f"({age_min} min ago)")
+            st.warning(
+                "The background logger (live_logger.py) hasn't reported in over "
+                "10 minutes — check the Pi's cron job and live_logger.log."
+            )
         else:
-            st.info("No data available yet. Refresh to try again.")
+            st.info(
+                "No live data yet. Make sure live_logger.py is running on the Pi "
+                "(cron job every 5 minutes) to populate live_readings.db."
+            )
     with hdr_right:
         auto_refresh = st.toggle("Auto-refresh 30s", value=False)
         if st.button("Refresh now"):
@@ -2172,7 +2080,10 @@ with tab6:
     grid_export  = max(0,  grid_kw)
     batt_charge  = max(0,  batt_kw)
     batt_disc    = max(0, -batt_kw)
-    inv_temp     = d.get("inv_temp", 0)
+    # Average across the 3 inverters for the summary card; individual
+    # per-inverter temps are shown in the Inverter & Grid Details expander.
+    _inv_temps_raw = [d.get(f"inv{i}_temp", 0) for i in range(1, 4)]
+    inv_temp     = sum(_inv_temps_raw) / len(_inv_temps_raw) if _inv_temps_raw else 0
     cloud        = d.get("cloud_cover", 0)
     irradiance   = d.get("irradiance", 0)
     temperature  = d.get("temperature", 0)
@@ -2227,9 +2138,10 @@ with tab6:
                 f"SoC: {batt_soc:.0f}%", "#888888"), unsafe_allow_html=True)
     with c5:
         soc_color = "#E24B4A" if batt_soc < 20 else "#EF9F27" if batt_soc < 50 else "#1D9E75"
+        _inv_temp_label = f"{inv_temp:.1f}degC" if inv_temp > 0 else "N/A"
         st.markdown(power_card(
             "Battery SoC", f"{batt_soc:.0f}", "%",
-            f"Inverter: {inv_temp:.1f}degC", soc_color), unsafe_allow_html=True)
+            f"Inverter: {_inv_temp_label}", soc_color), unsafe_allow_html=True)
 
     # ── SECTION 1B — Animated Sankey Energy Flow ──────────────────────────────
     st.markdown("---")
@@ -2472,8 +2384,9 @@ with tab6:
             for i, sv in strings.items():
                 p = round(sv["v"] * sv["a"] / 1000, 3)
                 powers.append(p)
+                inv_num, string_num = i.split("-")
                 str_rows.append({
-                    "String": f"PV {i}",
+                    "String": f"Inv{inv_num} PV{string_num}",
                     "Voltage (V)": round(sv["v"], 2),
                     "Current (A)": round(sv["a"], 3),
                     "Power (kW)":  p,
@@ -2614,15 +2527,33 @@ with tab6:
     # ── SECTION 8 — Inverter Details (collapsed) ──────────────────────────────
     st.markdown("---")
     with st.expander("Inverter & Grid Details", expanded=False):
+        _total_inv_pv_kw = sum(d.get(f"inv{i}_pv_kw", 0) for i in range(1, 4))
         inv1, inv2, inv3, inv4 = st.columns(4)
-        inv1.metric("PV Power",       f"{d.get('inv_pv_kw',0):.2f} kW")
-        inv2.metric("Inverter Temp",  f"{d.get('inv_temp',0):.1f} degC",
-                    delta="High" if d.get('inv_temp',0) > 60 else "Normal",
-                    delta_color="inverse" if d.get('inv_temp',0) > 60 else "off")
+        inv1.metric("Total PV Power (3 inverters)", f"{_total_inv_pv_kw:.2f} kW")
+        inv2.metric("Avg Inverter Temp",
+                    f"{inv_temp:.1f} degC" if inv_temp > 0 else "N/A",
+                    delta=("High" if inv_temp > 60 else "Normal") if inv_temp > 0 else None,
+                    delta_color="inverse" if inv_temp > 60 else "off")
         inv3.metric("Power Factor",   f"{live_data.get('power_factor',0):.3f}" if live_data else "—")
         inv4.metric("Grid Frequency", f"{live_data.get('grid_freq',0):.2f} Hz" if live_data else "—",
                     delta="OK" if live_data and 49.5 <= live_data.get('grid_freq',50) <= 50.5 else "Out of range",
                     delta_color="off" if live_data and 49.5 <= live_data.get('grid_freq',50) <= 50.5 else "inverse")
+
+        st.markdown("**Per-Inverter Temperature & PV Output**")
+        st.caption(
+            "Note: internal temperature isn't reported by this inverter model/firmware "
+            "(also absent from the Sigenergy portal's own Real Time Info panel) - "
+            "shown as '—' when unavailable rather than a misleading 0 degC."
+        )
+        inv_rows = [{
+            "Inverter": f"Inverter {i}",
+            "Temp (degC)": (f"{d.get(f'inv{i}_temp', 0):.1f}" if d.get(f"inv{i}_temp", 0) > 0 else "—"),
+            "PV Power (kW)": round(d.get(f"inv{i}_pv_kw", 0), 2),
+            "Status": ("High" if d.get(f"inv{i}_temp", 0) > 60
+                        else "Normal" if d.get(f"inv{i}_temp", 0) > 0
+                        else "—"),
+        } for i in range(1, 4)]
+        st.dataframe(pd.DataFrame(inv_rows), use_container_width=True, hide_index=True)
 
         if live_data and live_data.get("phases"):
             st.markdown("**Grid Phases**")
@@ -2690,411 +2621,18 @@ with tab6:
         st.plotly_chart(fig_bsoc, use_container_width=True)
 
     else:
-        st.info("No trend data yet — data builds up as this tab refreshes. Check back in a few minutes.")
+        st.info(
+            "No 7-day trend data yet — history builds up as live_logger.py "
+            "runs on the Pi every 5 minutes. Check back in a few hours."
+        )
 
     # ── Auto-refresh ──────────────────────────────────────────────────────────
     if auto_refresh:
+        import time as _time
         _time.sleep(30)
         st.cache_data.clear()
         st.rerun()
 
-
-# ── Raw data (optional) ───────────────────────────────────────────────────────
-if show_raw:
-    st.divider()
-    st.subheader("Raw Hourly Data")
-    st.dataframe(hourly, use_container_width=True)
-
-    # ── Config ────────────────────────────────────────────────────────────────
-    # Load credentials from st.secrets (Streamlit Cloud) or os.getenv (local .env)
-    def _get_secret(key, default=None):
-        try:
-            return st.secrets[key]
-        except Exception:
-            return os.getenv(key, default)
-
-    LIVE_API_BASE    = _get_secret("SIGEN_API_BASE", "https://openapi-eu.sigencloud.com")
-    LIVE_SYSTEM_ID   = _get_secret("SIGEN_SYSTEM_ID", "HUCUD1764140703")
-    LIVE_USERNAME    = _get_secret("SIGEN_USERNAME")
-    LIVE_PASSWORD    = _get_secret("SIGEN_PASSWORD")
-    LIVE_INVERTER_SN = _get_secret("SIGEN_INVERTER_SN", "110B1K500388")
-
-    # Umhlanga coordinates for weather
-    LAT, LON = -29.7215, 31.0498
-    SA_TZ_OFFSET = _td(hours=2)
-
-    # SQLite DB path — stores live readings for trend charts
-    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_readings.db")
-
-    # ── SQLite setup ──────────────────────────────────────────────────────────
-    def init_db():
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS live_readings (
-                ts          TEXT PRIMARY KEY,
-                pv_kw       REAL,
-                grid_kw     REAL,
-                load_kw     REAL,
-                battery_kw  REAL,
-                battery_soc REAL,
-                cloud_cover REAL,
-                irradiance  REAL,
-                temperature REAL
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-    def save_reading(ts, pv, grid, load, batt, soc, cloud, irr, temp):
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("""
-            INSERT OR REPLACE INTO live_readings
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (ts, pv, grid, load, batt, soc, cloud, irr, temp))
-        conn.commit()
-        conn.close()
-
-    def load_history(days=7):
-        conn = sqlite3.connect(DB_PATH)
-        cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
-        df = pd.read_sql(
-            "SELECT * FROM live_readings WHERE ts >= ? ORDER BY ts",
-            conn, params=(cutoff,)
-        )
-        conn.close()
-        return df
-
-    init_db()
-
-    # ── API helpers ───────────────────────────────────────────────────────────
-    @st.cache_data(ttl=300)  # cache token for 5 minutes
-    def get_live_token():
-        r = _requests.post(
-            f"{LIVE_API_BASE}/openapi/auth/login/password",
-            json={"username": LIVE_USERNAME, "password": LIVE_PASSWORD},
-            timeout=10
-        )
-        body = r.json()
-        if body.get("code") != 0:
-            return None
-        data = _json_live.loads(body["data"]) if isinstance(body["data"], str) else body["data"]
-        return data["accessToken"]
-
-    def fetch_energy_flow(token):
-        """GET /openapi/systems/{systemId}/energyFlow — live power flow."""
-        headers = {"Authorization": f"Bearer {token}"}
-        r = _requests.get(
-            f"{LIVE_API_BASE}/openapi/systems/{LIVE_SYSTEM_ID}/energyFlow",
-            headers=headers, timeout=10
-        )
-        body = r.json()
-        if body.get("code") != 0:
-            return None
-        data = body.get("data", {})
-        if isinstance(data, str):
-            data = _json_live.loads(data)
-        return data
-
-    def fetch_system_summary(token):
-        """GET /openapi/systems/{systemId}/summary — daily/monthly totals."""
-        headers = {"Authorization": f"Bearer {token}"}
-        r = _requests.get(
-            f"{LIVE_API_BASE}/openapi/systems/{LIVE_SYSTEM_ID}/summary",
-            headers=headers, timeout=10
-        )
-        body = r.json()
-        if body.get("code") != 0:
-            return None
-        data = body.get("data", {})
-        if isinstance(data, str):
-            data = _json_live.loads(data)
-        return data
-
-    def fetch_device_realtime(token, serial_number):
-        """GET /openapi/systems/{systemId}/devices/{serialNumber}/realtimeInfo"""
-        headers = {"Authorization": f"Bearer {token}"}
-        r = _requests.get(
-            f"{LIVE_API_BASE}/openapi/systems/{LIVE_SYSTEM_ID}/devices/{serial_number}/realtimeInfo",
-            headers=headers, timeout=10
-        )
-        body = r.json()
-        if body.get("code") != 0:
-            return None
-        data = body.get("data", {})
-        if isinstance(data, str):
-            data = _json_live.loads(data)
-        return data.get("realTimeInfo", data)
-
-    def fetch_weather():
-        """Fetch current weather and irradiance from Open-Meteo (free, no key)."""
-        try:
-            r = _requests.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude":  LAT,
-                    "longitude": LON,
-                    "current":   "temperature_2m,cloud_cover,wind_speed_10m,precipitation",
-                    "hourly":    "shortwave_radiation,cloud_cover,temperature_2m",
-                    "forecast_days": 1,
-                    "timezone":  "Africa/Johannesburg",
-                },
-                timeout=10
-            )
-            d = r.json()
-            curr = d.get("current", {})
-            # Get current hour's irradiance
-            now_hour = _dt.now().strftime("%Y-%m-%dT%H:00")
-            hourly_times = d.get("hourly", {}).get("time", [])
-            irr = 0.0
-            if now_hour in hourly_times:
-                idx = hourly_times.index(now_hour)
-                irr = d["hourly"]["shortwave_radiation"][idx] or 0.0
-            return {
-                "temperature": curr.get("temperature_2m", 0),
-                "cloud_cover": curr.get("cloud_cover", 0),
-                "wind_speed":  curr.get("wind_speed_10m", 0),
-                "precipitation": curr.get("precipitation", 0),
-                "irradiance":  irr,
-            }
-        except Exception:
-            return {"temperature": 0, "cloud_cover": 0, "wind_speed": 0,
-                    "precipitation": 0, "irradiance": 0}
-
-    # ── Refresh controls ──────────────────────────────────────────────────────
-    col_refresh, col_auto = st.columns([1, 2])
-    with col_refresh:
-        manual_refresh = st.button("Refresh now")
-    with col_auto:
-        auto_refresh = st.toggle("Auto-refresh every 30s", value=True)
-
-    if auto_refresh:
-        st.caption("Auto-refreshing every 30 seconds...")
-
-    # ── Fetch live data ───────────────────────────────────────────────────────
-    live_error = None
-    flow = None
-    summary = None
-    device_rt = None
-    weather = {}
-
-    try:
-        token = get_live_token()
-        if token:
-            flow      = fetch_energy_flow(token)
-            summary   = fetch_system_summary(token)
-            device_rt = fetch_device_realtime(token, LIVE_INVERTER_SN)
-        else:
-            live_error = "Authentication failed — check SIGEN credentials in .env"
-    except Exception as e:
-        live_error = str(e)
-
-    weather = fetch_weather()
-
-    if live_error:
-        st.error(f"API error: {live_error}")
-    elif flow is None:
-        st.warning("No live data returned from API.")
-    else:
-        # Extract values
-        pv_kw   = float(flow.get("pvPower", 0) or 0)
-        grid_kw = float(flow.get("gridPower", 0) or 0)  # +ve = export, -ve = import
-        load_kw = float(flow.get("loadPower", 0) or 0)
-        batt_kw = float(flow.get("batteryPower", 0) or 0)  # +ve = charging, -ve = discharging
-        batt_soc= float(flow.get("batterySoc", 0) or 0)
-
-        grid_import_kw = max(0, -grid_kw)
-        grid_export_kw = max(0, grid_kw)
-        batt_charge_kw = max(0, batt_kw)
-        batt_disc_kw   = max(0, -batt_kw)
-
-        now_ts = _dt.now(_tz.utc).isoformat()
-        save_reading(now_ts, pv_kw, grid_kw, load_kw, batt_kw, batt_soc,
-                     weather.get("cloud_cover", 0),
-                     weather.get("irradiance", 0),
-                     weather.get("temperature", 0))
-
-        # ── SECTION 1 — Live KPIs ─────────────────────────────────────────────
-        st.subheader("Live Power Flow")
-        now_str = _dt.now(_tz(_td(hours=2))).strftime("%d %b %Y %H:%M:%S SAST")
-        st.caption(f"Last updated: {now_str}")
-
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Solar", f"{pv_kw:.1f} kW",
-                  help="Current PV generation")
-        k2.metric("Load", f"{load_kw:.1f} kW",
-                  help="Current site load")
-        k3.metric("Grid",
-                  f"{grid_import_kw:.1f} kW import" if grid_import_kw > 0 else f"{grid_export_kw:.1f} kW export",
-                  delta=f"{'Importing' if grid_import_kw > 0 else 'Exporting'}",
-                  delta_color="inverse" if grid_import_kw > 0 else "normal")
-        k4.metric("Battery",
-                  f"{batt_charge_kw:.1f} kW" if batt_charge_kw > 0 else f"{batt_disc_kw:.1f} kW",
-                  delta="Charging" if batt_charge_kw > 0 else "Discharging" if batt_disc_kw > 0 else "Idle")
-        k5.metric("Battery SoC", f"{batt_soc:.0f}%",
-                  help="Battery state of charge")
-
-        # Battery SoC gauge
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=batt_soc,
-            title={"text": "Battery State of Charge (%)"},
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar":  {"color": "#1D9E75"},
-                "steps": [
-                    {"range": [0, 20],  "color": "#E24B4A"},
-                    {"range": [20, 50], "color": "#EF9F27"},
-                    {"range": [50, 100],"color": "#1D9E75"},
-                ],
-                "threshold": {
-                    "line": {"color": "white", "width": 2},
-                    "thickness": 0.75,
-                    "value": batt_soc,
-                }
-            }
-        ))
-        fig_gauge.update_layout(height=280)
-        st.plotly_chart(fig_gauge, use_container_width=True)
-
-        # ── Inverter realtime details ──────────────────────────────────────────
-        if device_rt:
-            st.divider()
-            st.subheader("Inverter Details")
-            inv_c1, inv_c2, inv_c3, inv_c4, inv_c5, inv_c6 = st.columns(6)
-            inv_c1.metric("PV Power",       f"{float(device_rt.get('pvTotalPower', 0) or 0):.2f} kW")
-            inv_c2.metric("Inverter Temp",  f"{float(device_rt.get('internalTemperature', 0) or 0):.1f} degC")
-            inv_c3.metric("Battery Power",  f"{float(device_rt.get('batPower', 0) or 0):.2f} kW",
-                          help="Positive = discharging, Negative = charging")
-            inv_c4.metric("Daily PV",       f"{float(device_rt.get('pvEnergyDaily', 0) or 0):.2f} kWh")
-            inv_c5.metric("Lifetime PV",    f"{float(device_rt.get('pvEnergyTotal', 0) or 0):.1f} kWh")
-            inv_c6.metric("Batt Discharged Today", f"{float(device_rt.get('esDischargingDay', 0) or 0):.2f} kWh")
-
-            # PV Strings — show individual string voltages and currents
-            st.markdown("**PV String Details**")
-            strings_data = []
-            for i in range(1, 5):
-                v = float(device_rt.get(f"pv{i}Voltage", 0) or 0)
-                c = float(device_rt.get(f"pv{i}Current", 0) or 0)
-                p = round(v * c / 1000, 3)  # kW
-                if v != 0 or c != 0:
-                    strings_data.append({
-                        "String": f"PV String {i}",
-                        "Voltage (V)": round(v, 2),
-                        "Current (A)": round(c, 3),
-                        "Power (kW)":  p,
-                    })
-            if strings_data:
-                st.dataframe(pd.DataFrame(strings_data), use_container_width=True, hide_index=True)
-
-            # Phase voltages and currents
-            st.markdown("**Grid Phase Details**")
-            phase_data = []
-            for ph in ["a", "b", "c"]:
-                v = float(device_rt.get(f"{ph}PhaseVoltage", 0) or 0)
-                c = float(device_rt.get(f"{ph}PhaseCurrent", 0) or 0)
-                phase_data.append({
-                    "Phase": ph.upper(),
-                    "Voltage (V)": round(v, 2),
-                    "Current (A)": round(c, 3),
-                    "Power (kW)":  round(v * c / 1000, 3),
-                })
-            st.dataframe(pd.DataFrame(phase_data), use_container_width=True, hide_index=True)
-
-            pf = device_rt.get("powerFactor")
-            freq = device_rt.get("gridFrequency")
-            if pf or freq:
-                pf_col, freq_col = st.columns(2)
-                if pf:
-                    pf_col.metric("Power Factor", f"{float(pf):.3f}")
-                if freq:
-                    freq_col.metric("Grid Frequency", f"{float(freq):.2f} Hz")
-
-        # Summary metrics from system summary
-        if summary:
-            st.divider()
-            st.subheader("Today's Energy Summary")
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Solar Today",      f"{summary.get('dailyPowerGeneration', 0):.1f} kWh")
-            s2.metric("Solar This Month",  f"{summary.get('monthlyPowerGeneration', 0):.1f} kWh")
-            s3.metric("Solar This Year",   f"{summary.get('annualPowerGeneration', 0):.1f} kWh")
-            s4.metric("Lifetime Solar",    f"{summary.get('lifetimePowerGeneration', 0):.1f} kWh")
-
-            env1, env2, env3 = st.columns(3)
-            env1.metric("CO2 Saved (lifetime)", f"{summary.get('lifetimeCo2', 0):.2f} tons")
-            env2.metric("Coal Saved (lifetime)", f"{summary.get('lifetimeCoal', 0):.2f} tons")
-            env3.metric("Trees Equivalent",      f"{summary.get('lifetimeTreeEquivalent', 0):.0f} trees")
-
-    # ── SECTION 2 — Weather ───────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Current Weather — Umhlanga")
-    w1, w2, w3, w4 = st.columns(4)
-    w1.metric("Temperature",   f"{weather.get('temperature', 0):.1f} degC")
-    w2.metric("Cloud Cover",   f"{weather.get('cloud_cover', 0):.0f}%")
-    w3.metric("Wind Speed",    f"{weather.get('wind_speed', 0):.1f} km/h")
-    w4.metric("Solar Irradiance", f"{weather.get('irradiance', 0):.0f} W/m2")
-
-    # ── SECTION 3 — 7-day history chart ──────────────────────────────────────
-    st.divider()
-    st.subheader("Last 7 Days — Solar Power vs Weather")
-
-    hist = load_history(days=7)
-    if not hist.empty:
-        hist["ts"] = pd.to_datetime(hist["ts"]).dt.tz_convert("Africa/Johannesburg")
-
-        fig_hist = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_hist.add_trace(
-            go.Scatter(x=hist["ts"], y=hist["pv_kw"],
-                       name="Solar (kW)", line=dict(color="#EF9F27", width=2)),
-            secondary_y=False
-        )
-        fig_hist.add_trace(
-            go.Scatter(x=hist["ts"], y=hist["load_kw"],
-                       name="Load (kW)", line=dict(color="#E24B4A", dash="dot")),
-            secondary_y=False
-        )
-        fig_hist.add_trace(
-            go.Scatter(x=hist["ts"], y=hist["cloud_cover"],
-                       name="Cloud Cover (%)", line=dict(color="#7F77DD", dash="dash"),
-                       opacity=0.7),
-            secondary_y=True
-        )
-        fig_hist.add_trace(
-            go.Scatter(x=hist["ts"], y=hist["irradiance"],
-                       name="Irradiance (W/m2)", line=dict(color="#3B8BD4", dash="dot"),
-                       opacity=0.7),
-            secondary_y=True
-        )
-        fig_hist.update_layout(
-            title="Solar Power vs Cloud Cover & Irradiance",
-            xaxis_title="Date / Time",
-            legend_title="Metric",
-            height=420,
-        )
-        fig_hist.update_yaxes(title_text="Power (kW)", secondary_y=False)
-        fig_hist.update_yaxes(title_text="Cloud % / Irradiance W/m2", secondary_y=True)
-        st.plotly_chart(fig_hist, use_container_width=True)
-
-        # Battery SoC trend
-        fig_soc = go.Figure()
-        fig_soc.add_scatter(x=hist["ts"], y=hist["battery_soc"],
-                            name="Battery SoC (%)",
-                            fill="tozeroy", line=dict(color="#1D9E75"),
-                            fillcolor="rgba(29,158,117,0.2)")
-        fig_soc.update_layout(
-            title="Battery State of Charge — Last 7 Days",
-            xaxis_title="Date / Time",
-            yaxis=dict(title="SoC (%)", range=[0, 105]),
-            height=300,
-        )
-        st.plotly_chart(fig_soc, use_container_width=True)
-    else:
-        st.info("No historical live data yet — readings are stored each time this tab is refreshed. Check back in a few minutes.")
-
-    # Auto-refresh using Streamlit's rerun
-    if auto_refresh:
-        import time as _time
-        _time.sleep(30)
-        st.rerun()
 
 # ── Raw data (optional) ───────────────────────────────────────────────────────
 if show_raw:

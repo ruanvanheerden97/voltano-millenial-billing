@@ -310,9 +310,27 @@ def main():
             dates_to_fetch = all_dates
             print(f"  --full flag set: re-fetching all {len(all_dates)} dates.\n")
         else:
-            dates_to_fetch = [d for d in all_dates if d not in existing_dates]
-            print(f"  {len(existing_dates)} dates already in Excel. "
-                  f"Fetching {len(dates_to_fetch)} new dates.\n")
+            missing_dates = [d for d in all_dates if d not in existing_dates]
+
+            # ALWAYS re-fetch today's date, even if it's already in existing_dates.
+            # Today is necessarily an incomplete day (more hours become available
+            # as the day progresses), so "already have today" must not mean
+            # "skip today" - otherwise the hourly cron job freezes at whatever
+            # hour first successfully fetched that day and never updates again
+            # until the date rolls over at midnight.
+            today_already_present = today in existing_dates
+            dates_to_fetch = list(missing_dates)
+            if today not in dates_to_fetch:
+                dates_to_fetch.append(today)
+
+            if today_already_present:
+                print(f"  {len(existing_dates)} dates already in Excel "
+                      f"({len(missing_dates)} fully missing). "
+                      f"Re-fetching today ({today}) to pick up new hours, "
+                      f"plus {len(missing_dates)} missing date(s).\n")
+            else:
+                print(f"  {len(existing_dates)} dates already in Excel. "
+                      f"Fetching {len(dates_to_fetch)} date(s) including today.\n")
 
     if not dates_to_fetch:
         print("[OK]  Excel is already up to date - nothing to fetch.")
