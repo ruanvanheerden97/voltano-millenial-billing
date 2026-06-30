@@ -1970,12 +1970,15 @@ with tab6:
     # fallback), so the dashboard can be auto-refreshed as often as you like
     # (e.g. every 30s during a demo) without ever risking error 1201.
 
-    def load_latest() -> dict:
-        """Return the most recent reading as a dict. Tries live_readings.db
-        first (true real-time, available on the Pi); falls back to
-        live_latest.csv (up to ~1hr old, available wherever GitHub synced it,
-        e.g. Streamlit Cloud) if the DB doesn't exist. Returns {} if neither
-        source is available."""
+    def load_latest() -> tuple[dict, str]:
+        """Return (reading_dict, source) where source is 'db', 'csv', or 'none'.
+        Tries live_readings.db first (true real-time, available on the Pi);
+        falls back to live_latest.csv (up to ~1hr old, available wherever
+        GitHub synced it, e.g. Streamlit Cloud) if the DB doesn't exist.
+        The source matters because the two have very different freshness
+        cadences - 5 minutes for the DB, up to an hour for the CSV - so the
+        "is this stale" check downstream needs to use a different threshold
+        depending on which one we actually read from."""
         if os.path.exists(DB_PATH):
             try:
                 conn = sqlite3.connect(DB_PATH)
@@ -1985,7 +1988,7 @@ with tab6:
                 cols = [d[0] for d in conn.execute("SELECT * FROM live_readings LIMIT 0").description] if row else []
                 conn.close()
                 if row:
-                    return dict(zip(cols, row))
+                    return dict(zip(cols, row)), "db"
             except Exception:
                 pass
 
@@ -1994,11 +1997,11 @@ with tab6:
             try:
                 df = pd.read_csv(LATEST_CSV_PATH)
                 if len(df) > 0:
-                    return df.iloc[0].to_dict()
+                    return df.iloc[0].to_dict(), "csv"
             except Exception:
                 pass
 
-        return {}
+        return {}, "none"
 
     def load_history(days=7) -> pd.DataFrame:
         """Return readings from the last `days` days, oldest first. Same
@@ -2031,8 +2034,8 @@ with tab6:
 
         return pd.DataFrame()
 
-    # ── Load latest reading from DB ────────────────────────────────────────────
-    d = load_latest()
+    # ── Load latest reading from DB (or CSV fallback) ──────────────────────────
+    d, data_source = load_latest()
 
     data_fresh = False
     reading_age_seconds = None
@@ -2042,9 +2045,15 @@ with tab6:
             if reading_ts.tzinfo is None:
                 reading_ts = reading_ts.tz_localize("UTC")
             reading_age_seconds = (pd.Timestamp.now(tz="UTC") - reading_ts).total_seconds()
-            # "Fresh" = logged within the last 10 minutes (allows for the 5-min
-            # cron interval plus a bit of slack for a slow run or cron drift)
-            data_fresh = reading_age_seconds < 600
+            # Freshness threshold depends on the data source:
+            # - DB: live_logger.py runs every 5 min, so 10 min allows one
+            #   missed cycle plus slack before flagging as stale.
+            # - CSV: hourly_export_push.sh runs once per hour, so a much
+            #   longer threshold is needed - otherwise the CSV fallback would
+            #   ALWAYS show as stale, defeating the point of having it. 90
+            #   min allows one full hourly cycle plus slack.
+            freshness_threshold = 600 if data_source == "db" else 5400
+            data_fresh = reading_age_seconds < freshness_threshold
         except Exception:
             data_fresh = False
 
@@ -2075,13 +2084,14 @@ with tab6:
     hdr_left, hdr_right = st.columns([3, 1])
     with hdr_left:
         st.subheader("Live System Dashboard — The Millennial")
+        _source_label = "updates every 5 min" if data_source == "db" else "synced hourly from Pi via GitHub"
         if data_fresh:
             reading_ts_local = pd.Timestamp(d["ts"])
             if reading_ts_local.tzinfo is None:
                 reading_ts_local = reading_ts_local.tz_localize("UTC")
             reading_ts_local = reading_ts_local.tz_convert("Africa/Johannesburg")
             st.caption(f"Last reading: {reading_ts_local.strftime('%d %b %Y %H:%M:%S')} SAST "
-                       f"(updates every 5 min)")
+                       f"({_source_label})")
         elif d:
             reading_ts_local = pd.Timestamp(d["ts"])
             if reading_ts_local.tzinfo is None:
@@ -2090,14 +2100,23 @@ with tab6:
             age_min = int(reading_age_seconds // 60) if reading_age_seconds else 0
             st.caption(f"Last reading: {reading_ts_local.strftime('%d %b %Y %H:%M:%S')} SAST "
                        f"({age_min} min ago)")
-            st.warning(
-                "The background logger (live_logger.py) hasn't reported in over "
-                "10 minutes — check the Pi's cron job and live_logger.log."
-            )
+            if data_source == "db":
+                st.warning(
+                    "The background logger (live_logger.py) hasn't reported in over "
+                    "10 minutes — check the Pi's cron job and live_logger.log."
+                )
+            else:
+                st.warning(
+                    "The hourly GitHub sync (hourly_export_push.sh on the Pi) hasn't "
+                    "updated in over 90 minutes — check that script's cron job and log "
+                    "on the Pi."
+                )
         else:
             st.info(
                 "No live data yet. Make sure live_logger.py is running on the Pi "
-                "(cron job every 5 minutes) to populate live_readings.db."
+                "(cron job every 5 minutes) to populate live_readings.db, and that "
+                "hourly_export_push.sh is syncing it to GitHub if you're viewing this "
+                "on Streamlit Cloud."
             )
     with hdr_right:
         auto_refresh = st.toggle("Auto-refresh 30s", value=False)
