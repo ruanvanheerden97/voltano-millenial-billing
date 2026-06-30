@@ -1,0 +1,6 @@
+[2026-06-30 10:50:01 SAST]  live_logger starting...
+  [WARN]  Inverter 1 (110A133M0196) fetch failed: HTTPSConnectionPool(host='openapi-eu.sigencloud.com', port=443): Read timed out. (read timeout=10)
+  [OK]  Saved: PV=8.00kW  Load=15.43kW  Batt=42%SoC  Inv1=0.0C Inv2=0.0C Inv3=0.0C  WxTemp=19.6C  Cloud=98%  Pruned=0 old rows
+[2026-06-30 10:55:01 SAST]  live_logger starting...
+  [WARN]  Inverter 1 (110A133M0196) fetch failed: HTTPSConnectionPool(host='openapi-eu.sigencloud.com', port=443): Read timed out. (read timeout=10)
+  [OK]  Saved: PV=8.10kW  Load=22.75kW  Batt=43%SoC  Inv1=0.0C Inv2=0.0C Inv3=0.0C  WxTemp=19.6C  Cloud=98%  Pruned=0 old rows
