@@ -16,3 +16,4 @@ Thumbs.db
 # Keep the Excel data file tracked (needed for Streamlit Cloud)
 # If you ever want to exclude it, uncomment the line below:
 # *.xlsx
+live_readings.db
