@@ -6,7 +6,6 @@ from plotly.subplots import make_subplots
 from datetime import time
 import numpy as np
 import os
-import subprocess
 
 st.set_page_config(
     page_title="Voltano Billing Tool",
@@ -2316,49 +2315,6 @@ with tab6:
         if st.button("Refresh now"):
             st.cache_data.clear()
             st.rerun()
-
-        # Only show this button when running on the Pi itself (where
-        # live_readings.db and hourly_export_push.sh both actually exist).
-        # On Streamlit Cloud there's nothing local to export - the CSVs
-        # only ever get refreshed by the Pi's own cron job.
-        export_script_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "hourly_export_push.sh"
-        )
-        if os.path.exists(DB_PATH) and os.path.exists(export_script_path):
-            if st.button(
-                "Force GitHub sync now",
-                help=(
-                    "Runs hourly_export_push.sh immediately instead of waiting "
-                    "for the next scheduled hourly run - exports the latest "
-                    "live_readings.db data to CSV and pushes it to GitHub right "
-                    "away, so the Streamlit Cloud version picks up fresh data "
-                    "without delay."
-                ),
-            ):
-                with st.spinner("Exporting and pushing to GitHub..."):
-                    try:
-                        result = subprocess.run(
-                            ["bash", export_script_path],
-                            cwd=os.path.dirname(export_script_path),
-                            capture_output=True, text=True, timeout=60,
-                        )
-                        if result.returncode == 0:
-                            st.success("Export + push completed successfully.")
-                        else:
-                            st.error(
-                                f"hourly_export_push.sh exited with code "
-                                f"{result.returncode}. Check the output below."
-                            )
-                        with st.expander("Script output", expanded=(result.returncode != 0)):
-                            st.code(result.stdout + result.stderr or "(no output)")
-                    except subprocess.TimeoutExpired:
-                        st.error(
-                            "Script timed out after 60s - likely a git push hanging "
-                            "on network/credentials. Check it manually on the Pi: "
-                            "`bash hourly_export_push.sh`"
-                        )
-                    except Exception as e:
-                        st.error(f"Failed to run export script: {e}")
 
     if not d:
         st.stop()
