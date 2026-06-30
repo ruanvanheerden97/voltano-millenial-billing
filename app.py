@@ -390,7 +390,79 @@ billing_runs = load_billing_runs_config()
 
 # Re-assign billing_run column in daily data using the JSON config
 # so sorting and grouping is always correct
-def assign_billing_run(d: pd.Timestamp, runs: dict) -> str:
+def compute_grid_import_tou_share(hourly: pd.DataFrame, billing_run_dates: dict) -> pd.DataFrame:
+    """
+    For each billing run, compute what % of TOTAL grid import (kWh) fell into
+    each TOU slot (Peak / Standard / Off-Peak). This is %-based rather than
+    raw kWh because total load and total solar generation both change over
+    time (new appliances, seasonal variation, panel degradation, etc.) - a
+    rising kWh of peak import could just mean "the site uses more power now",
+    whereas a rising % of peak import specifically means "the battery
+    strategy is shifting less of the load away from peak than it used to".
+
+    This is the right metric to judge whether the battery dispatch strategy
+    (charge off-peak/solar, discharge at peak on weekdays and into the
+    weekend standard windows) is actually working, independent of how much
+    the site's overall consumption has grown or shrunk.
+
+    Returns a DataFrame with one row per billing run:
+      Period, Period Start, Period End, Total Grid Import (kWh),
+      Peak %, Standard %, Off-Peak %,
+      Peak pp Change, Standard pp Change, Off-Peak pp Change
+    (pp = percentage points vs. the immediately preceding billing run -
+    NOT vs. the same row's own kWh, since these are share-of-total deltas)
+    """
+    start_date = pd.Timestamp("2025-12-05")
+    sorted_runs = sorted(billing_run_dates.items(), key=lambda x: x[1])
+    rows = []
+
+    for i, (billing_run, end_date) in enumerate(sorted_runs):
+        if i == 0:
+            period_start = start_date
+        else:
+            prev_end = sorted_runs[i - 1][1]
+            period_start = prev_end + pd.Timedelta(days=1)
+
+        mask = (
+            (hourly["datetime"] >= period_start) &
+            (hourly["datetime"] < end_date + pd.Timedelta(days=1))
+        )
+        period = hourly[mask]
+
+        total_import = period["grid_import_kwh"].sum()
+        peak_import    = period[period["tou_slot"] == "1.8.1"]["grid_import_kwh"].sum()
+        std_import     = period[period["tou_slot"] == "1.8.2"]["grid_import_kwh"].sum()
+        offpeak_import = period[period["tou_slot"] == "1.8.3"]["grid_import_kwh"].sum()
+
+        if total_import > 0:
+            peak_pct    = round(100 * peak_import / total_import, 2)
+            std_pct     = round(100 * std_import / total_import, 2)
+            offpeak_pct = round(100 * offpeak_import / total_import, 2)
+        else:
+            peak_pct = std_pct = offpeak_pct = 0.0
+
+        rows.append({
+            "Billing Run":              billing_run,
+            "Period Start":             period_start.date(),
+            "Period End":               end_date.date(),
+            "Total Grid Import (kWh)":  round(total_import, 1),
+            "Peak %":                   peak_pct,
+            "Standard %":               std_pct,
+            "Off-Peak %":               offpeak_pct,
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Month-over-month change in percentage points (this row's % minus the
+    # previous row's %) - this is the "are we shaving more or less than last
+    # period" signal. Positive Peak pp Change = a BIGGER share of grid import
+    # is now happening at peak than last period (worse shaving). Negative =
+    # smaller share at peak (better shaving).
+    for col in ["Peak %", "Standard %", "Off-Peak %"]:
+        change_col = col.replace(" %", " pp Change")
+        df[change_col] = df[col].diff().round(2)
+
+    return df
     """Assign a date to the correct billing run based on end dates."""
     d_date = d.date() if hasattr(d, "date") else d
     for run_name, end_date in sorted(runs.items(), key=lambda x: x[1]):
@@ -561,6 +633,109 @@ with tab1:
             height=380,
         )
         st.plotly_chart(fig_trend, use_container_width=True)
+
+    # ── Peak/Standard Shaving Effectiveness ────────────────────────────────────
+    st.divider()
+    st.subheader("⚖️ Peak/Standard Shaving Effectiveness")
+    st.caption(
+        "What % of total GRID IMPORT falls into each TOU slot, per billing period. "
+        "This is %-based rather than raw kWh because total load and solar generation "
+        "both change over time — a falling **% share at Peak** means the battery "
+        "strategy is genuinely shifting more consumption away from expensive hours, "
+        "independent of whether the site is using more or less power overall. "
+        "The 'pp Change' columns show the percentage-point shift vs. the immediately "
+        "preceding billing run — negative is good (less of your import is at Peak/Std "
+        "than last period), positive means shaving is getting worse."
+    )
+
+    shaving_df = compute_grid_import_tou_share(hourly, billing_runs)
+
+    if len(shaving_df) > 0:
+        # Style: highlight negative pp changes (improving) green, positive (worsening) red
+        def _pp_change_color(val):
+            if pd.isna(val):
+                return ""
+            if val < 0:
+                return "color: #1D9E75"   # improving - smaller share at this slot than last period
+            elif val > 0:
+                return "color: #E24B4A"   # worsening - bigger share at this slot than last period
+            return ""
+
+        pp_cols = ["Peak pp Change", "Standard pp Change", "Off-Peak pp Change"]
+        pct_cols = ["Peak %", "Standard %", "Off-Peak %"]
+
+        styled_shaving = shaving_df.style.format(
+            {**{c: "{:.2f}%" for c in pct_cols},
+             **{c: "{:+.2f} pp" for c in pp_cols},
+             "Total Grid Import (kWh)": "{:.1f}"}
+        ).map(_pp_change_color, subset=pp_cols)
+
+        st.dataframe(styled_shaving, use_container_width=True, hide_index=True)
+
+        # Download
+        shaving_csv = shaving_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download shaving effectiveness CSV",
+            shaving_csv,
+            file_name=f"{site_name}_grid_import_tou_share.csv",
+            mime="text/csv",
+        )
+
+        # ── Trend chart: % share by TOU slot over billing periods ─────────────
+        fig_shaving = go.Figure()
+        fig_shaving.add_scatter(
+            x=shaving_df["Billing Run"], y=shaving_df["Peak %"],
+            mode="lines+markers", name="Peak %",
+            line=dict(color="#E24B4A", width=2), marker=dict(size=7),
+        )
+        fig_shaving.add_scatter(
+            x=shaving_df["Billing Run"], y=shaving_df["Standard %"],
+            mode="lines+markers", name="Standard %",
+            line=dict(color="#EF9F27", width=2), marker=dict(size=7),
+        )
+        fig_shaving.add_scatter(
+            x=shaving_df["Billing Run"], y=shaving_df["Off-Peak %"],
+            mode="lines+markers", name="Off-Peak %",
+            line=dict(color="#1D9E75", width=2), marker=dict(size=7),
+        )
+        fig_shaving.update_layout(
+            xaxis_title="Billing Run",
+            yaxis_title="% of Total Grid Import",
+            yaxis=dict(range=[0, 100]),
+            legend_title="TOU Slot",
+            height=380,
+            title="Grid Import Share by TOU Slot — Trend Across Billing Periods",
+        )
+        st.plotly_chart(fig_shaving, use_container_width=True)
+
+        # ── Latest period vs. previous period summary callout ─────────────────
+        if len(shaving_df) >= 2:
+            latest = shaving_df.iloc[-1]
+            prev   = shaving_df.iloc[-2]
+            peak_change = latest["Peak pp Change"]
+            std_change  = latest["Standard pp Change"]
+
+            summary_col1, summary_col2 = st.columns(2)
+            with summary_col1:
+                if pd.notna(peak_change):
+                    direction = "improved" if peak_change < 0 else "worsened" if peak_change > 0 else "held steady"
+                    st.metric(
+                        f"Peak Share — {latest['Billing Run']} vs {prev['Billing Run']}",
+                        f"{latest['Peak %']:.2f}%",
+                        delta=f"{peak_change:+.2f} pp ({direction})",
+                        delta_color="inverse",  # negative (smaller peak share) shown as "good" green
+                    )
+            with summary_col2:
+                if pd.notna(std_change):
+                    direction = "improved" if std_change < 0 else "worsened" if std_change > 0 else "held steady"
+                    st.metric(
+                        f"Standard Share — {latest['Billing Run']} vs {prev['Billing Run']}",
+                        f"{latest['Standard %']:.2f}%",
+                        delta=f"{std_change:+.2f} pp ({direction})",
+                        delta_color="inverse",
+                    )
+    else:
+        st.info("No billing run data available yet to calculate shaving effectiveness.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
