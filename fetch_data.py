@@ -48,13 +48,19 @@ START_DATE   = date(2025, 12, 5)   # meter start date
 
 # API field -> Excel column name mapping
 # Based on Sigenergy API itemList fields from documentation
+# API field -> Excel column name mapping
+# Using the cumulative ENERGY fields (kWh, reset daily at midnight)
+# NOT the instantaneous POWER fields (kW) which end in "Power"
+# The energy fields are: powerGeneration, powerUse, powerFromGrid,
+# powerToGrid, esCharging, esDischarging
+# These are cumulative daily totals — build_hourly_rows converts them to per-interval deltas
 HOURLY_COL_MAP = {
-    "pvTotalPower":    "Total Solar Production Energy (kWh)",
+    "powerGeneration": "Total Solar Production Energy (kWh)",
     "powerUse":        "Total Load Consumed Energy (kWh)",
-    "esChargePower":   "Total Battery Charge Energy (kWh)",
-    "esDischargePower":"Total Battery Discharge Energy (kWh)",
-    "fromGridPower":   "Total Grid Imported Energy (kWh)",
-    "toGridPower":     "Total Grid Exported Energy (kWh)",
+    "esCharging":      "Total Battery Charge Energy (kWh)",
+    "esDischarging":   "Total Battery Discharge Energy (kWh)",
+    "powerFromGrid":   "Total Grid Imported Energy (kWh)",
+    "powerToGrid":     "Total Grid Exported Energy (kWh)",
 }
 
 DAILY_COL_MAP = {
@@ -163,13 +169,16 @@ def build_hourly_rows(day: date, data: dict) -> list[dict]:
     """
     Convert API itemList into per-interval usage rows for the hourly sheet.
 
-    The API returns CUMULATIVE daily totals in each interval (resetting at midnight).
-    We convert these to per-interval USAGE by subtracting the previous interval value.
-    This gives the actual energy used/produced in each 5-minute slot.
+    The API returns CUMULATIVE daily energy totals (kWh, resetting at midnight)
+    in fields like powerGeneration, powerUse, esCharging etc.
+    We convert these to per-interval USAGE by subtracting the previous value.
+
+    Note: Do NOT use the instantaneous *Power fields (pvTotalPower, loadPower etc.)
+    as those are kW snapshots, not energy values.
 
     Example:
-        API row 1: pvTotalPower = 1.5  (cumulative from midnight)
-        API row 2: pvTotalPower = 3.2
+        API row 1: powerGeneration = 1.5  (cumulative from midnight)
+        API row 2: powerGeneration = 3.2
         Stored row 1: 1.5 - 0.0 = 1.5 kWh used in interval 1
         Stored row 2: 3.2 - 1.5 = 1.7 kWh used in interval 2
     """
@@ -193,14 +202,23 @@ def build_hourly_rows(day: date, data: dict) -> list[dict]:
             current = float(item.get(api_field, 0) or 0)
             prev    = prev_values[api_field]
 
-            # If current < prev it means the cumulative reset (shouldn't happen mid-day
-            # but handle gracefully — treat as a fresh start from current value)
-            if current < prev:
+            # Determine if this is a genuine midnight reset or just noise/rounding.
+            # A genuine reset means current is significantly smaller than prev
+            # (e.g. daily cumulative restarted at midnight).
+            # Small drops (< 1 kWh) are noise — treat delta as 0, keep prev.
+            # Large drops (>= 1 kWh below prev) are genuine resets — start fresh.
+            drop = prev - current
+            if drop > 1.0:
+                # Genuine reset — new day started mid-fetch or data anomaly
                 delta = current
+            elif drop > 0:
+                # Tiny noise/rounding drop — treat as zero usage in this interval
+                delta = 0.0
             else:
+                # Normal increment
                 delta = current - prev
 
-            row[col_name]        = round(delta, 6)
+            row[col_name]          = round(max(0.0, delta), 6)
             prev_values[api_field] = current
 
         rows.append(row)

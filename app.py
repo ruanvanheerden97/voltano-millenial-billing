@@ -14,129 +14,170 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ─── TOU CLASSIFICATION ───────────────────────────────────────────────────────
+# ─── TOU CLASSIFICATION (config-driven, multi-period) ─────────────────────────
+# Schedule and tariff rates are loaded from tou_tariffs.json as a list of
+# PERIODS, each with its own effective_from date. This means when tariffs
+# change each year, a new period is appended — historical data keeps using
+# whichever schedule/rates were in effect at the time, instead of being
+# silently recalculated with the newest rates. See load_tou_config() below.
+
+import json as _json_tou
+import bisect as _bisect_tou
+
+@st.cache_data
+def load_tou_config() -> dict:
+    """Load TOU periods from tou_tariffs.json, sorted by effective_from."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tou_tariffs.json")
+    if not os.path.exists(config_path):
+        st.error(
+            "tou_tariffs.json not found. This file defines the TOU time slots "
+            "and tariff rates — the app cannot calculate billing without it."
+        )
+        st.stop()
+    with open(config_path) as f:
+        raw = _json_tou.load(f)
+    periods = sorted(raw["periods"], key=lambda p: p["effective_from"])
+    return periods
+
+TOU_PERIODS = load_tou_config()
+_TOU_PERIOD_STARTS = [pd.Timestamp(p["effective_from"]) for p in TOU_PERIODS]
+
+# Most recent period's rates are used for "current" displays (e.g. live tab).
+# Kept for backward compatibility with code that references TARIFF/SELL_RATE directly.
+TARIFF    = TOU_PERIODS[-1]["tariffs_rkwh"]
+SELL_RATE = TOU_PERIODS[-1]["sell_rate_rkwh"]
+
+def get_period_for_date(dt) -> dict:
+    """Return the tariff period dict that was in effect on the given date."""
+    d = pd.Timestamp(dt)
+    idx = _bisect_tou.bisect_right(_TOU_PERIOD_STARTS, d) - 1
+    idx = max(0, min(idx, len(TOU_PERIODS) - 1))
+    return TOU_PERIODS[idx]
 
 def get_season(dt):
-    """Return 'high' (Jun-Aug) or 'low' (Sep-May) demand season."""
-    return "high" if dt.month in [6, 7, 8] else "low"
+    """Return 'high' or 'low' demand season, using the period in effect on dt."""
+    period = get_period_for_date(dt)
+    return "high" if dt.month in period["season_months"]["high"] else "low"
+
+def _hour_in_ranges(h, ranges):
+    """Check if hour h falls in any [start, end) range from the config."""
+    return any(start <= h < end for start, end in ranges)
 
 def get_tou_slot(dt):
     """
-    Classify a datetime into Peak (1.8.1), Standard (1.8.2), or Off-Peak (1.8.3).
-    Returns the register string: '1.8.1', '1.8.2', or '1.8.3'
-    Based on Eskom TOU tariff schedule.
+    Classify a datetime into Peak (1.8.1), Standard (1.8.2), or Off-Peak (1.8.3),
+    using whichever tariff period (schedule) was in effect on that date.
     """
-    season = get_season(dt)
+    period = get_period_for_date(dt)
+    season = "high" if dt.month in period["season_months"]["high"] else "low"
     dow = dt.weekday()   # 0=Mon, 5=Sat, 6=Sun
-    h = dt.hour          # hour of day (0-23), represents the hour STARTING at that time
+    h = dt.hour
 
-    # ── SUNDAY (all seasons) ──────────────────────────────────────
     if dow == 6:
-        if season == "low":
-            if 18 <= h < 20:
-                return "1.8.2"
-            else:
-                return "1.8.3"
-        else:  # high
-            if 17 <= h < 19:
-                return "1.8.2"
-            else:
-                return "1.8.3"
-
-    # ── SATURDAY ─────────────────────────────────────────────────
+        day_type = "sunday"
     elif dow == 5:
-        if season == "low":
-            if h < 7 or h >= 20:
-                return "1.8.3"
-            elif 7 <= h < 12 or 18 <= h < 20:
-                return "1.8.2"
-            else:  # 12:00-18:00
-                return "1.8.3"
-        else:  # high
-            if h < 7 or h >= 19:
-                return "1.8.3"
-            elif 7 <= h < 12 or 17 <= h < 19:
-                return "1.8.2"
-            else:  # 12:00-17:00
-                return "1.8.3"
-
-    # ── WEEKDAY (Mon-Fri) ────────────────────────────────────────
+        day_type = "saturday"
     else:
-        if season == "low":
-            if h < 6 or h >= 22:
-                return "1.8.3"
-            elif h == 6 or (9 <= h < 18) or (21 <= h < 22):
-                return "1.8.2"
-            elif (7 <= h < 9) or (18 <= h < 21):
-                return "1.8.1"
-            else:
-                return "1.8.2"
-        else:  # high
-            if h < 6 or h >= 22:
-                return "1.8.3"
-            elif (8 <= h < 17) or (20 <= h < 22):
-                return "1.8.2"
-            elif (6 <= h < 8) or (17 <= h < 20):
-                return "1.8.1"
-            else:
-                return "1.8.2"
+        day_type = "weekday"
+
+    slots = period["schedule"][day_type][season]
+    if "peak" in slots and _hour_in_ranges(h, slots["peak"]):
+        return "1.8.1"
+    if "standard" in slots and _hour_in_ranges(h, slots["standard"]):
+        return "1.8.2"
+    return "1.8.3"
+
+def get_tariff_for_date(dt, tou_slot: str) -> float:
+    """Return the R/kWh rate for a given datetime + TOU slot, using the
+    period that was in effect on that date. Use this instead of TARIFF[s][t]
+    directly anywhere a specific date is involved."""
+    period = get_period_for_date(dt)
+    season = "high" if dt.month in period["season_months"]["high"] else "low"
+    return period["tariffs_rkwh"][season][tou_slot]
+
+def get_sell_rate_for_date(dt) -> float:
+    """Return the flat sell rate (R/kWh) in effect on the given date."""
+    return get_period_for_date(dt)["sell_rate_rkwh"]
 
 
 def assign_tou_vectorised(hourly: pd.DataFrame) -> pd.DataFrame:
     """
-    Fully vectorised TOU slot and season assignment — no row-by-row apply().
-    ~50× faster than apply(get_tou_slot) on large datasets.
+    Fully vectorised TOU slot, season, and tariff assignment, period-aware.
+    Adds columns: tou_slot, season, tariff_rkwh, sell_rate_rkwh.
+    Rows are grouped by which tariff period they fall under (by effective_from
+    date) BEFORE the TOU schedule is applied, so historical rows always use
+    the schedule/rates that were actually in effect at the time — even after
+    a new tariff period is added to tou_tariffs.json for a later year.
     """
+    hourly = hourly.copy()
     dt  = hourly["datetime"]
     h   = dt.dt.hour
-    dow = dt.dt.weekday          # 0=Mon … 6=Sun
+    dow = dt.dt.weekday          # 0=Mon ... 6=Sun
     mon = dt.dt.month
 
-    season = pd.Series(
-        np.where(mon.isin([6, 7, 8]), "high", "low"),
-        index=hourly.index
+    period_starts_arr = np.array(_TOU_PERIOD_STARTS, dtype="datetime64[ns]")
+    dt_arr = dt.values.astype("datetime64[ns]")
+    period_idx = np.clip(
+        np.searchsorted(period_starts_arr, dt_arr, side="right") - 1,
+        0, len(TOU_PERIODS) - 1
     )
 
-    is_high    = season == "high"
+    hourly["tou_slot"]      = "1.8.3"
+    hourly["season"]        = ""
+    hourly["tariff_rkwh"]   = 0.0
+    hourly["sell_rate_rkwh"] = 0.0
+
     is_weekday = dow < 5
     is_sat     = dow == 5
     is_sun     = dow == 6
 
-    # Start everything as Off-Peak then overwrite in priority order
-    slot = pd.Series("1.8.3", index=hourly.index)
+    for p_idx, period in enumerate(TOU_PERIODS):
+        in_period = period_idx == p_idx
+        if not in_period.any():
+            continue
 
-    # ── SUNDAY ────────────────────────────────────────────────────
-    std_sun = is_sun & (
-        (~is_high & h.between(18, 19)) |
-        (is_high  & h.between(17, 18))
-    )
-    slot = slot.where(~std_sun, "1.8.2")
+        is_high = mon.isin(period["season_months"]["high"]) & in_period
+        is_low  = in_period & ~is_high
+        hourly.loc[is_high, "season"] = "high"
+        hourly.loc[is_low, "season"]  = "low"
+        hourly.loc[in_period, "sell_rate_rkwh"] = period["sell_rate_rkwh"]
 
-    # ── SATURDAY ──────────────────────────────────────────────────
-    std_sat = is_sat & (
-        (~is_high & (h.between(7, 11)  | h.between(18, 19))) |
-        (is_high  & (h.between(7, 11)  | h.between(17, 18)))
-    )
-    slot = slot.where(~std_sat, "1.8.2")
+        day_type_masks = [
+            ("sunday", is_sun & in_period),
+            ("saturday", is_sat & in_period),
+            ("weekday", is_weekday & in_period),
+        ]
+        season_masks = [("low", is_low), ("high", is_high)]
 
-    # ── WEEKDAY ───────────────────────────────────────────────────
-    # Standard
-    std_wd = is_weekday & (
-        (~is_high & ((h == 6) | h.between(9, 17) | (h == 21))) |
-        (is_high  & (h.between(8, 16) | h.between(20, 21)))
-    )
-    slot = slot.where(~std_wd, "1.8.2")
+        for day_type, day_mask in day_type_masks:
+            if not day_mask.any():
+                continue
+            for season_name, season_mask in season_masks:
+                base_mask = day_mask & season_mask
+                if not base_mask.any():
+                    continue
+                slots_cfg = period["schedule"][day_type][season_name]
 
-    # Peak (overwrites standard where applicable)
-    peak_wd = is_weekday & (
-        (~is_high & (h.between(7, 8)  | h.between(18, 20))) |
-        (is_high  & (h.between(6, 7)  | h.between(17, 19)))
-    )
-    slot = slot.where(~peak_wd, "1.8.1")
+                if "standard" in slots_cfg:
+                    std_mask = pd.Series(False, index=hourly.index)
+                    for start, end in slots_cfg["standard"]:
+                        std_mask = std_mask | h.between(start, end - 1)
+                    hourly.loc[base_mask & std_mask, "tou_slot"] = "1.8.2"
 
-    hourly = hourly.copy()
-    hourly["tou_slot"] = slot
-    hourly["season"]   = season
+                if "peak" in slots_cfg:
+                    peak_mask = pd.Series(False, index=hourly.index)
+                    for start, end in slots_cfg["peak"]:
+                        peak_mask = peak_mask | h.between(start, end - 1)
+                    hourly.loc[base_mask & peak_mask, "tou_slot"] = "1.8.1"
+
+        # Assign tariff rate per row based on season + tou_slot, within this period only
+        for season_name in ["low", "high"]:
+            for slot_code in ["1.8.1", "1.8.2", "1.8.3"]:
+                mask = in_period & (hourly["season"] == season_name) & (hourly["tou_slot"] == slot_code)
+                if mask.any():
+                    rate = period["tariffs_rkwh"][season_name][slot_code]
+                    hourly.loc[mask, "tariff_rkwh"] = rate
+
     return hourly
 
 # ─── DATA LOADING ─────────────────────────────────────────────────────────────
@@ -356,11 +397,8 @@ daily["billing_run"] = daily["date"].apply(lambda d: assign_billing_run(d, billi
 daily = daily.sort_values("date").reset_index(drop=True)
 
 # ─── TARIFF CONSTANTS ─────────────────────────────────────────────────────────
-TARIFF = {
-    "low":  {"1.8.1": 3.1682, "1.8.2": 2.5487, "1.8.3": 1.4826},
-    "high": {"1.8.1": 5.9163, "1.8.2": 1.9068, "1.8.3": 1.1100},
-}
-SELL_RATE = 3.2795  # R/kWh — flat sell rate regardless of season/TOU
+# TARIFF and SELL_RATE are loaded from tou_tariffs.json near the top of this
+# file (see load_tou_config()). Edit that JSON file to update rates each year.
 
 # ─── TABS ─────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -761,13 +799,9 @@ with tab3:
     h["solar_to_batt"] = np.minimum(h["batt_charge_kwh"], h["solar_kwh"])
     h["grid_to_batt"]  = np.maximum(0.0, h["batt_charge_kwh"] - h["solar_kwh"])
 
-    # Vectorised tariff lookup
-    _tmap = {(s, t): TARIFF[s][t]
-             for s in ["low", "high"] for t in ["1.8.1", "1.8.2", "1.8.3"]}
-    h["slot_tariff"] = pd.Series(
-        [_tmap[(s, t)] for s, t in zip(h["season"], h["tou_slot"])],
-        index=h.index
-    )
+    # Per-row tariff already assigned by assign_tou_vectorised() using the
+    # correct period for each row's date — no date-blind lookup needed.
+    h["slot_tariff"] = h["tariff_rkwh"]
 
     is_weekday_h = h["datetime"].dt.weekday < 5
 
@@ -784,8 +818,17 @@ with tab3:
 
     # Stream 1 revenue: 15% of slot tariff for grid-discharge kWh
     # Cost recovery: off-peak tariff paid to municipality
-    offpeak_tariff_h = h["season"].map({"low": TARIFF["low"]["1.8.3"], "high": TARIFF["high"]["1.8.3"]})
-    std_tariff_h     = h["season"].map({"low": TARIFF["low"]["1.8.2"], "high": TARIFF["high"]["1.8.2"]})
+    # Per-row off-peak/standard tariffs, date-aware (vectorised via period+season groups)
+    offpeak_tariff_h = pd.Series(0.0, index=h.index)
+    std_tariff_h     = pd.Series(0.0, index=h.index)
+    for period in TOU_PERIODS:
+        p_start = pd.Timestamp(period["effective_from"])
+        p_mask = h["datetime"] >= p_start
+        # Narrow to just this period's rows (later periods will overwrite earlier ones below)
+        for season_name in ["low", "high"]:
+            s_mask = p_mask & (h["season"] == season_name)
+            offpeak_tariff_h = offpeak_tariff_h.where(~s_mask, period["tariffs_rkwh"][season_name]["1.8.3"])
+            std_tariff_h     = std_tariff_h.where(~s_mask, period["tariffs_rkwh"][season_name]["1.8.2"])
 
     h["rev_grid_disc"]  = h["disc_from_grid"]  * h["slot_tariff"] * batt_margin
     h["cost_grid_charge"]= h["grid_to_batt"]   * offpeak_tariff_h   # what you paid municipality
@@ -799,7 +842,7 @@ with tab3:
     # Stream 3: Solar → direct load or grid export (not going into battery)
     # Solar available for export/direct = total solar − solar_to_batt
     h["solar_direct"]   = np.maximum(0.0, h["solar_kwh"] - h["solar_to_batt"])
-    h["rev_solar_direct"]= h["solar_direct"] * SELL_RATE
+    h["rev_solar_direct"]= h["solar_direct"] * h["sell_rate_rkwh"]
     h["cost_solar_direct"]= h["solar_direct"] * solar_kwh_cost
 
     # Body corporate levy — 8% of ALL solar at sell rate (deducted from total)
@@ -840,7 +883,10 @@ with tab3:
 
         solar_total     = seg["solar_kwh"].sum()
         bc_kwh          = solar_total * bc_rate
-        bc_cost_r       = bc_kwh * SELL_RATE
+        # Body corporate cost uses each row's own sell rate, weighted by its
+        # share of solar — correct even if this billing run spans a tariff
+        # period boundary (e.g. an April rate change mid-run).
+        bc_cost_r       = (seg["solar_kwh"] * bc_rate * seg["sell_rate_rkwh"]).sum()
 
         rev_grid        = seg["rev_grid_disc"].sum()
         rev_solar_disc  = seg["rev_solar_disc"].sum()
@@ -1152,24 +1198,16 @@ with tab4:
             "Scheduled", "Unscheduled"
         )
 
-        # ── Vectorised tariff lookup for grid charge cost ─────────────────────
-        # Build a tariff series from season + tou_slot without apply()
-        tariff_map = {
-            ("low",  "1.8.1"): TARIFF["low"]["1.8.1"],
-            ("low",  "1.8.2"): TARIFF["low"]["1.8.2"],
-            ("low",  "1.8.3"): TARIFF["low"]["1.8.3"],
-            ("high", "1.8.1"): TARIFF["high"]["1.8.1"],
-            ("high", "1.8.2"): TARIFF["high"]["1.8.2"],
-            ("high", "1.8.3"): TARIFF["high"]["1.8.3"],
-        }
-        tariff_key           = list(zip(df["season"], df["tou_slot"]))
-        df["tou_tariff"]     = pd.Series([tariff_map[k] for k in tariff_key], index=df.index)
+        # ── Per-row tariff for grid charge cost (already date-aware) ─────────
+        # tariff_rkwh and sell_rate_rkwh are assigned by assign_tou_vectorised()
+        # using the correct period for each row's date.
+        df["tou_tariff"] = df["tariff_rkwh"]
 
         df["grid_charge_cost_r"]  = df["grid_to_battery"]  * df["tou_tariff"]
         df["solar_charge_cost_r"] = df["solar_to_battery"] * solar_cost
         df["charge_cost_r"]       = df["grid_charge_cost_r"] + df["solar_charge_cost_r"]
 
-        df["discharge_value_r"] = df["batt_discharge_kwh"] * SELL_RATE
+        df["discharge_value_r"] = df["batt_discharge_kwh"] * df["sell_rate_rkwh"]
         df["net_benefit_r"]     = df["discharge_value_r"] - df["charge_cost_r"]
 
         return df
@@ -1555,7 +1593,7 @@ with tab4:
     db1, db2, db3, db4 = st.columns(4)
     db1.metric("Total Discharge (kWh)",  f"{total_disc_kwh:,.1f} kWh")
     db2.metric("Discharge Value",        f"R {total_disc_value_r:,.2f}",
-               help=f"At flat sell rate of R{SELL_RATE}/kWh")
+               help=f"Calculated using each row's own period sell rate (currently R{SELL_RATE}/kWh)")
     db3.metric("Total Charge Cost",      f"R {total_charge_cost_r:,.2f}",
                help=f"Grid TOU tariff + Solar R{solar_cost_per_kwh:.4f}/kWh")
     db4.metric("Net Battery Benefit",    f"R {net_benefit_r:,.2f}",
@@ -2326,8 +2364,8 @@ with tab6:
     # Current TOU slot
     now_sa = _dt.now(_tz(_td(hours=2)))
     _tou_now = get_tou_slot(now_sa) if 'get_tou_slot' in dir() else "1.8.2"
-    _season_now = "high" if now_sa.month in [6,7,8] else "low"
-    _tariff_now = TARIFF[_season_now][_tou_now]
+    _season_now = get_season(now_sa)
+    _tariff_now = get_tariff_for_date(now_sa, _tou_now)
     _tou_name = {"1.8.1":"PEAK","1.8.2":"Standard","1.8.3":"Off-Peak"}[_tou_now]
     _tou_color = {"1.8.1":"#E24B4A","1.8.2":"#EF9F27","1.8.3":"#1D9E75"}[_tou_now]
 

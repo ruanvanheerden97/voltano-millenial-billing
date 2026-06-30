@@ -29,6 +29,7 @@ import os
 import io
 import csv
 import sys
+import json
 import argparse
 import paramiko
 import pandas as pd
@@ -50,6 +51,7 @@ SFTP_PATH     = os.getenv("SFTP_REMOTE_PATH", "/")   # folder on SFTP to drop fi
 
 EXCEL_FILE    = Path(__file__).parent / "MIL_Battery_readings_EMS.xlsx"
 START_DATE    = pd.Timestamp("2025-12-05")
+TOU_CONFIG_FILE = Path(__file__).parent / "tou_tariffs.json"
 
 # Virtual meter serial numbers -> (column in hourly sheet, display name)
 METERS = {
@@ -61,51 +63,85 @@ METERS = {
 # SA timezone offset
 SA_TZ = timezone(timedelta(hours=2))
 
-# --- TOU CLASSIFICATION (vectorised) -----------------------------------------
+# --- TOU CLASSIFICATION (config-driven, vectorised) ---------------------------
+
+def load_tou_config() -> list:
+    """Load TOU periods from tou_tariffs.json, sorted by effective_from.
+    Same file used by app.py, so the Pi scripts and the Streamlit app
+    always agree on the schedule for any given date."""
+    if not TOU_CONFIG_FILE.exists():
+        print(f"[ERROR]  tou_tariffs.json not found at {TOU_CONFIG_FILE}")
+        print("    This file defines the TOU schedule. Cannot continue without it.")
+        sys.exit(1)
+    with open(TOU_CONFIG_FILE) as f:
+        raw = json.load(f)
+    return sorted(raw["periods"], key=lambda p: p["effective_from"])
+
+TOU_PERIODS = load_tou_config()
+_TOU_PERIOD_STARTS = np.array(
+    [pd.Timestamp(p["effective_from"]) for p in TOU_PERIODS], dtype="datetime64[ns]"
+)
 
 def assign_tou_vectorised(df: pd.DataFrame) -> pd.DataFrame:
-    """Assign TOU slot and season to each hourly row - fully vectorised."""
+    """Assign TOU slot to each hourly row - fully vectorised, period-aware.
+    Rows are grouped by which tariff period they fall under (by effective_from
+    date) BEFORE the TOU schedule is applied, so historical rows always use
+    the schedule that was actually in effect at the time — even after a new
+    tariff period is added to tou_tariffs.json for a later year."""
+    df = df.copy()
     dt  = df["Date"]
     h   = dt.dt.hour
     dow = dt.dt.weekday
     mon = dt.dt.month
 
-    is_high    = mon.isin([6, 7, 8])
+    dt_arr = dt.values.astype("datetime64[ns]")
+    period_idx = np.clip(
+        np.searchsorted(_TOU_PERIOD_STARTS, dt_arr, side="right") - 1,
+        0, len(TOU_PERIODS) - 1
+    )
+
     is_weekday = dow < 5
     is_sat     = dow == 5
     is_sun     = dow == 6
 
     slot = pd.Series("1.8.3", index=df.index)
 
-    # Sunday
-    std_sun = is_sun & (
-        (~is_high & h.between(18, 19)) |
-        (is_high  & h.between(17, 18))
-    )
-    slot = slot.where(~std_sun, "1.8.2")
+    for p_idx, period in enumerate(TOU_PERIODS):
+        in_period = period_idx == p_idx
+        if not in_period.any():
+            continue
 
-    # Saturday
-    std_sat = is_sat & (
-        (~is_high & (h.between(7, 11) | h.between(18, 19))) |
-        (is_high  & (h.between(7, 11) | h.between(17, 18)))
-    )
-    slot = slot.where(~std_sat, "1.8.2")
+        is_high = mon.isin(period["season_months"]["high"]) & in_period
+        is_low  = in_period & ~is_high
 
-    # Weekday standard
-    std_wd = is_weekday & (
-        (~is_high & ((h == 6) | h.between(9, 17) | (h == 21))) |
-        (is_high  & (h.between(8, 16) | h.between(20, 21)))
-    )
-    slot = slot.where(~std_wd, "1.8.2")
+        day_type_masks = [
+            ("sunday", is_sun & in_period),
+            ("saturday", is_sat & in_period),
+            ("weekday", is_weekday & in_period),
+        ]
+        season_masks = [("low", is_low), ("high", is_high)]
 
-    # Weekday peak
-    peak_wd = is_weekday & (
-        (~is_high & (h.between(7, 8)  | h.between(18, 20))) |
-        (is_high  & (h.between(6, 7)  | h.between(17, 19)))
-    )
-    slot = slot.where(~peak_wd, "1.8.1")
+        for day_type, day_mask in day_type_masks:
+            if not day_mask.any():
+                continue
+            for season_name, season_mask in season_masks:
+                base_mask = day_mask & season_mask
+                if not base_mask.any():
+                    continue
+                slots_cfg = period["schedule"][day_type][season_name]
 
-    df = df.copy()
+                if "standard" in slots_cfg:
+                    std_mask = pd.Series(False, index=df.index)
+                    for start, end in slots_cfg["standard"]:
+                        std_mask = std_mask | h.between(start, end - 1)
+                    slot = slot.where(~(base_mask & std_mask), "1.8.2")
+
+                if "peak" in slots_cfg:
+                    peak_mask = pd.Series(False, index=df.index)
+                    for start, end in slots_cfg["peak"]:
+                        peak_mask = peak_mask | h.between(start, end - 1)
+                    slot = slot.where(~(base_mask & peak_mask), "1.8.1")
+
     df["tou_slot"] = slot
     return df
 
