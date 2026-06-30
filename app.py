@@ -2908,41 +2908,58 @@ with tab6:
         fig_bsoc.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
         st.plotly_chart(fig_bsoc, use_container_width=True)
 
-        # ── 9C. Weather — TWO separate charts, never sharing a y-axis ─────────
-        st.subheader("🌤️ Weather")
-        wx_col1, wx_col2 = st.columns(2)
-        with wx_col1:
-            fig_irr = go.Figure()
-            fig_irr.add_scatter(
-                x=hist["ts"], y=hist["irradiance"], name="Irradiance",
+        # ── 9C. Weather + Solar Production — stacked, synced x-axis ───────────
+        # Three genuinely different units (kW, W/m², %) so each gets its own
+        # y-axis - but stacking them with a SHARED x-axis (rather than side
+        # by side) lets you trace a vertical line straight down through all
+        # three and see exactly how a cloud cover dip lines up with an
+        # irradiance drop and the resulting dip in actual solar output.
+        st.subheader("🌤️ Weather vs. solar production")
+        st.caption(
+            "Stacked with a shared time axis so you can trace cause and effect "
+            "vertically: a cloud cover spike should line up with an irradiance "
+            "dip, which should line up with a dip in solar production. Each "
+            "panel keeps its own scale since the three are different units."
+        )
+
+        fig_weather_combo = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.34, 0.33, 0.33],
+            subplot_titles=("Solar production (kW)", "Irradiance (W/m²)", "Cloud cover (%)"),
+            vertical_spacing=0.06,
+        )
+        fig_weather_combo.add_trace(
+            go.Scatter(
+                x=hist["ts"], y=hist["pv_kw"], name="Solar production",
                 line=dict(color="#EF9F27", width=2),
-                fill="tozeroy", fillcolor="rgba(239,159,39,0.12)",
-            )
-            fig_irr.update_layout(
-                height=280, title="Solar irradiance",
-                yaxis=dict(title="W/m²", rangemode="tozero"),
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=40, b=10, l=10, r=10), showlegend=False,
-            )
-            fig_irr.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-            fig_irr.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-            st.plotly_chart(fig_irr, use_container_width=True)
-        with wx_col2:
-            fig_cloud = go.Figure()
-            fig_cloud.add_scatter(
+                fill="tozeroy", fillcolor="rgba(239,159,39,0.15)",
+            ), row=1, col=1
+        )
+        fig_weather_combo.add_trace(
+            go.Scatter(
+                x=hist["ts"], y=hist["irradiance"], name="Irradiance",
+                line=dict(color="#D85A30", width=2),
+                fill="tozeroy", fillcolor="rgba(216,90,48,0.15)",
+            ), row=2, col=1
+        )
+        fig_weather_combo.add_trace(
+            go.Scatter(
                 x=hist["ts"], y=hist["cloud_cover"], name="Cloud cover",
                 line=dict(color="#7F77DD", width=2),
                 fill="tozeroy", fillcolor="rgba(127,119,221,0.15)",
-            )
-            fig_cloud.update_layout(
-                height=280, title="Cloud cover",
-                yaxis=dict(title="%", range=[0, 100]),
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=40, b=10, l=10, r=10), showlegend=False,
-            )
-            fig_cloud.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-            fig_cloud.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-            st.plotly_chart(fig_cloud, use_container_width=True)
+            ), row=3, col=1
+        )
+        fig_weather_combo.update_layout(
+            height=620, showlegend=False,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=30, b=10, l=10, r=10),
+        )
+        fig_weather_combo.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_weather_combo.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_weather_combo.update_yaxes(rangemode="tozero", row=1, col=1)
+        fig_weather_combo.update_yaxes(rangemode="tozero", row=2, col=1)
+        fig_weather_combo.update_yaxes(range=[0, 100], row=3, col=1)
+        st.plotly_chart(fig_weather_combo, use_container_width=True)
 
         # ── 9D. Per-inverter PV power comparison ───────────────────────────────
         st.subheader("☀️ Per-inverter solar output")
