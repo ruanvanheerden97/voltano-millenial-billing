@@ -2851,61 +2851,277 @@ with tab6:
                        for ph in ["a","b","c"]]
             st.dataframe(pd.DataFrame(ph_rows), use_container_width=True, hide_index=True)
 
-    # ── SECTION 9 — 7-day trends ──────────────────────────────────────────────
+    # ── SECTION 9 — 7-day trends & PV string diagnostics ──────────────────────
     st.markdown("---")
-    st.markdown("**Last 7 Days — Power & Weather Trends**")
+    st.header("📈 Trends & Panel Diagnostics — Last 7 Days")
 
     hist = load_history(days=7)
     if not hist.empty:
         hist["ts"] = pd.to_datetime(hist["ts"]).dt.tz_convert("Africa/Johannesburg")
+        hist = hist.sort_values("ts").reset_index(drop=True)
 
-        # Combined power + cloud cover chart
-        fig_hist = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.65, 0.35],
-            subplot_titles=("Power Flow (kW)", "Cloud Cover (%) & Irradiance (W/m2)"),
-            vertical_spacing=0.08,
+        # ── 9A. Power Flow — its own full-width chart, one y-axis (kW) ────────
+        st.subheader("⚡ Power Flow")
+        fig_power = go.Figure()
+        fig_power.add_scatter(
+            x=hist["ts"], y=hist["pv_kw"], name="Solar",
+            line=dict(color="#EF9F27", width=2),
+            fill="tozeroy", fillcolor="rgba(239,159,39,0.12)",
         )
-        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["pv_kw"],
-            name="Solar kW", line=dict(color="#EF9F27", width=2),
-            fill="tozeroy", fillcolor="rgba(239,159,39,0.15)"), row=1, col=1)
-        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["load_kw"],
-            name="Load kW", line=dict(color="#E24B4A", width=1.5, dash="dot")), row=1, col=1)
-        fig_hist.add_trace(go.Scatter(x=hist["ts"],
-            y=hist["grid_kw"].apply(lambda v: max(0,-v)),
-            name="Grid Import kW", line=dict(color="#7F77DD", width=1)), row=1, col=1)
-        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["battery_soc"],
-            name="Battery SoC %", line=dict(color="#1D9E75", width=1.5, dash="dash")), row=1, col=1)
-        fig_hist.add_trace(go.Bar(x=hist["ts"], y=hist["cloud_cover"],
-            name="Cloud Cover %", marker_color="rgba(127,119,221,0.4)"), row=2, col=1)
-        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["irradiance"],
-            name="Irradiance W/m2", line=dict(color="#EF9F27", width=1.5)), row=2, col=1)
-        fig_hist.update_layout(
-            height=480, legend_title="Metric",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
+        fig_power.add_scatter(
+            x=hist["ts"], y=hist["load_kw"], name="Load",
+            line=dict(color="#E24B4A", width=2, dash="dot"),
         )
-        fig_hist.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
-        fig_hist.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
-        st.plotly_chart(fig_hist, use_container_width=True)
+        fig_power.add_scatter(
+            x=hist["ts"], y=hist["grid_kw"].apply(lambda v: max(0, -v)),
+            name="Grid import", line=dict(color="#7F77DD", width=2),
+        )
+        fig_power.update_layout(
+            height=360,
+            yaxis_title="kW",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=10, l=10, r=10),
+        )
+        fig_power.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_power.update_yaxes(gridcolor="rgba(255,255,255,0.06)", rangemode="tozero")
+        st.plotly_chart(fig_power, use_container_width=True)
 
-        # Battery SoC trend with charge/discharge shading
+        # ── 9B. Battery SoC — separate chart, own 0-100% axis ──────────────────
+        st.subheader("🔋 Battery state of charge")
         fig_bsoc = go.Figure()
-        fig_bsoc.add_scatter(x=hist["ts"], y=hist["battery_soc"],
-            name="Battery SoC", fill="tozeroy",
-            line=dict(color="#1D9E75", width=2),
-            fillcolor="rgba(29,158,117,0.15)")
-        fig_bsoc.add_hline(y=20, line_dash="dash", line_color="#E24B4A",
-                           annotation_text="Low SoC threshold (20%)")
-        fig_bsoc.update_layout(
-            title="Battery State of Charge — Last 7 Days",
-            xaxis_title="", yaxis=dict(title="SoC (%)", range=[0,105]),
-            height=260, paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
+        fig_bsoc.add_scatter(
+            x=hist["ts"], y=hist["battery_soc"], name="Battery SoC",
+            fill="tozeroy", line=dict(color="#1D9E75", width=2),
+            fillcolor="rgba(29,158,117,0.12)",
         )
-        fig_bsoc.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
-        fig_bsoc.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+        fig_bsoc.add_hline(
+            y=20, line_dash="dash", line_color="#E24B4A",
+            annotation_text="Low SoC threshold (20%)", annotation_font_color="#E24B4A",
+        )
+        fig_bsoc.update_layout(
+            height=260, yaxis=dict(title="SoC (%)", range=[0, 105]),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
+        )
+        fig_bsoc.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_bsoc.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
         st.plotly_chart(fig_bsoc, use_container_width=True)
+
+        # ── 9C. Weather — TWO separate charts, never sharing a y-axis ─────────
+        st.subheader("🌤️ Weather")
+        wx_col1, wx_col2 = st.columns(2)
+        with wx_col1:
+            fig_irr = go.Figure()
+            fig_irr.add_scatter(
+                x=hist["ts"], y=hist["irradiance"], name="Irradiance",
+                line=dict(color="#EF9F27", width=2),
+                fill="tozeroy", fillcolor="rgba(239,159,39,0.12)",
+            )
+            fig_irr.update_layout(
+                height=280, title="Solar irradiance",
+                yaxis=dict(title="W/m²", rangemode="tozero"),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=40, b=10, l=10, r=10), showlegend=False,
+            )
+            fig_irr.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+            fig_irr.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+            st.plotly_chart(fig_irr, use_container_width=True)
+        with wx_col2:
+            fig_cloud = go.Figure()
+            fig_cloud.add_scatter(
+                x=hist["ts"], y=hist["cloud_cover"], name="Cloud cover",
+                line=dict(color="#7F77DD", width=2),
+                fill="tozeroy", fillcolor="rgba(127,119,221,0.15)",
+            )
+            fig_cloud.update_layout(
+                height=280, title="Cloud cover",
+                yaxis=dict(title="%", range=[0, 100]),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=40, b=10, l=10, r=10), showlegend=False,
+            )
+            fig_cloud.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+            fig_cloud.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+            st.plotly_chart(fig_cloud, use_container_width=True)
+
+        # ── 9D. Per-inverter PV power comparison ───────────────────────────────
+        st.subheader("☀️ Per-inverter solar output")
+        st.caption(
+            "Each inverter's own reported PV power output, side by side. If one "
+            "inverter consistently produces less than the other two under "
+            "similar daylight conditions, that points to either a string-level "
+            "fault on that inverter or a partial shading/soiling issue specific "
+            "to its panels — see the string-level breakdown below to pinpoint it."
+        )
+        fig_inv_compare = go.Figure()
+        inv_colors = {"inv1_pv_kw": "#EF9F27", "inv2_pv_kw": "#7F77DD", "inv3_pv_kw": "#1D9E75"}
+        for i, col in enumerate(["inv1_pv_kw", "inv2_pv_kw", "inv3_pv_kw"], start=1):
+            if col in hist.columns:
+                fig_inv_compare.add_scatter(
+                    x=hist["ts"], y=hist[col], name=f"Inverter {i}",
+                    line=dict(color=inv_colors[col], width=2),
+                )
+        fig_inv_compare.update_layout(
+            height=320, yaxis=dict(title="kW", rangemode="tozero"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=10, l=10, r=10),
+        )
+        fig_inv_compare.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_inv_compare.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        st.plotly_chart(fig_inv_compare, use_container_width=True)
+
+        # ── 9E. PV string fault detection ───────────────────────────────────────
+        st.subheader("🔍 PV string diagnostics — fault & mismatch detection")
+        st.caption(
+            "Compares the SUM of each inverter's 4 individual string readings "
+            "(voltage x current) against that inverter's OWN reported total PV "
+            "power. A meaningful gap between the two points to a specific "
+            "string with a problem - the per-string table below shows exactly "
+            "which one. A string reading near-zero voltage AND near-zero "
+            "current while its siblings are healthy usually means a "
+            "disconnected, faulty, or severely shaded/soiled panel string. "
+            "If the inverter's own total is ALSO near-zero, that's more "
+            "consistent with no strings being connected to that inverter at "
+            "all (or it being genuinely idle at night) rather than a fault."
+        )
+
+        # Restrict the fault analysis to meaningful daylight hours (irradiance
+        # above a low threshold) so we don't flag every inverter as "faulty"
+        # simply because it's night and everything reads near zero.
+        daylight = hist[hist["irradiance"] > 50] if "irradiance" in hist.columns else hist[hist["pv_kw"] > 0.5]
+
+        if len(daylight) > 0:
+            diag_rows = []
+            for inv in [1, 2, 3]:
+                pv_kw_col = f"inv{inv}_pv_kw"
+                if pv_kw_col not in daylight.columns:
+                    continue
+                string_sum_kw = sum(
+                    daylight[f"inv{inv}_pv{s}_v"] * daylight[f"inv{inv}_pv{s}_a"] / 1000
+                    for s in range(1, 5)
+                    if f"inv{inv}_pv{s}_v" in daylight.columns
+                )
+                reported_kw = daylight[pv_kw_col]
+                avg_string_sum = string_sum_kw.mean()
+                avg_reported = reported_kw.mean()
+                if avg_reported > 0.05:
+                    discrepancy_pct = 100 * (avg_reported - avg_string_sum) / avg_reported
+                else:
+                    discrepancy_pct = 0.0
+
+                if avg_reported < 0.1 and avg_string_sum < 0.1:
+                    status = "Idle / no strings connected"
+                elif abs(discrepancy_pct) > 15:
+                    status = "String data mismatch — check wiring/comms"
+                elif discrepancy_pct > 5:
+                    status = "Minor mismatch — monitor"
+                else:
+                    status = "OK"
+
+                diag_rows.append({
+                    "Inverter": f"Inverter {inv}",
+                    "Avg string-sum (kW)": round(avg_string_sum, 2),
+                    "Avg reported (kW)": round(avg_reported, 2),
+                    "Discrepancy": f"{discrepancy_pct:+.1f}%",
+                    "Status": status,
+                })
+
+            diag_df = pd.DataFrame(diag_rows)
+
+            def _status_color(val):
+                if "OK" in str(val):
+                    return "color: #1D9E75"
+                elif "Idle" in str(val):
+                    return "color: #888888"
+                elif "mismatch" in str(val).lower():
+                    return "color: #E24B4A"
+                return ""
+
+            st.dataframe(
+                diag_df.style.map(_status_color, subset=["Status"]),
+                use_container_width=True, hide_index=True,
+            )
+
+            # ── Per-string breakdown — pinpoint exactly which string is bad ───
+            st.markdown("**Per-string average power (daylight hours only)**")
+            string_rows = []
+            for inv in [1, 2, 3]:
+                for s in range(1, 5):
+                    v_col, a_col = f"inv{inv}_pv{s}_v", f"inv{inv}_pv{s}_a"
+                    if v_col not in daylight.columns:
+                        continue
+                    p = daylight[v_col] * daylight[a_col] / 1000
+                    avg_p = p.mean()
+                    avg_v = daylight[v_col].mean()
+                    string_rows.append({
+                        "String": f"Inv{inv} PV{s}",
+                        "Avg voltage (V)": round(avg_v, 1),
+                        "Avg power (kW)": round(avg_p, 3),
+                    })
+            string_df = pd.DataFrame(string_rows)
+
+            if len(string_df) > 0:
+                # Flag strings producing well below their siblings' average
+                # within the SAME inverter (a fairer comparison than the
+                # site-wide average, since inverters can legitimately have
+                # different numbers of panels per string).
+                string_df["_inv"] = string_df["String"].str.extract(r"Inv(\d)")[0]
+                inv_avg = string_df.groupby("_inv")["Avg power (kW)"].transform("mean")
+                string_df["% of inverter avg"] = (
+                    100 * string_df["Avg power (kW)"] / inv_avg.replace(0, np.nan)
+                ).fillna(0).round(0)
+                string_df = string_df.drop(columns=["_inv"])
+
+                def _string_pct_color(val):
+                    try:
+                        v = float(val)
+                    except (TypeError, ValueError):
+                        return ""
+                    if v < 50:
+                        return "color: #E24B4A"
+                    elif v < 80:
+                        return "color: #EF9F27"
+                    return "color: #1D9E75"
+
+                fig_strings = go.Figure()
+                bar_colors = [
+                    "#E24B4A" if p < 50 else "#EF9F27" if p < 80 else "#1D9E75"
+                    for p in string_df["% of inverter avg"]
+                ]
+                fig_strings.add_bar(
+                    x=string_df["String"], y=string_df["Avg power (kW)"],
+                    marker_color=bar_colors,
+                    text=[f"{p:.0f}%" for p in string_df["% of inverter avg"]],
+                    textposition="outside",
+                )
+                fig_strings.update_layout(
+                    height=320,
+                    yaxis_title="Avg power (kW)",
+                    xaxis_title="",
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
+                )
+                fig_strings.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+                fig_strings.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+                st.plotly_chart(fig_strings, use_container_width=True)
+                st.caption(
+                    "Bar labels show each string's output as a % of its own "
+                    "inverter's average string output. Below 50% (red) strongly "
+                    "suggests a fault, disconnection, or heavy "
+                    "soiling/shading specific to that string."
+                )
+
+                st.dataframe(
+                    string_df.style.format({"% of inverter avg": "{:.0f}%"})
+                                    .map(_string_pct_color, subset=["% of inverter avg"]),
+                    use_container_width=True, hide_index=True,
+                )
+        else:
+            st.info(
+                "No daylight-hours data in the last 7 days to run string "
+                "diagnostics on yet."
+            )
 
     else:
         st.info(
