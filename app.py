@@ -642,19 +642,25 @@ with tab1:
     st.caption(
         "What % of total GRID IMPORT falls into each TOU slot, per billing period. "
         "This is %-based rather than raw kWh because total load and solar generation "
-        "both change over time — a falling **% share at Peak** means the battery "
+        "both change over time — a falling **% share at Peak/Standard** means the battery "
         "strategy is genuinely shifting more consumption away from expensive hours, "
         "independent of whether the site is using more or less power overall. "
         "The 'pp Change' columns show the percentage-point shift vs. the immediately "
-        "preceding billing run — negative is good (less of your import is at Peak/Std "
-        "than last period), positive means shaving is getting worse."
+        "preceding billing run. For **Peak** and **Standard**, negative is good (shrinking "
+        "share of expensive import) and positive is bad. For **Off-Peak**, it's the mirror "
+        "image — positive is good (more import successfully shifted to the cheapest hours) "
+        "and negative is bad."
     )
 
     shaving_df = compute_grid_import_tou_share(hourly, billing_runs)
 
     if len(shaving_df) > 0:
-        # Style: highlight negative pp changes (improving) green, positive (worsening) red
-        def _pp_change_color(val):
+        # Color logic differs by slot: for Peak/Standard, a SHRINKING share is
+        # good (green) and a GROWING share is bad (red) - we want less import
+        # at expensive hours. For Off-Peak, it's the mirror image: a GROWING
+        # share is good (green) since that import shifted away from
+        # Peak/Standard, and a SHRINKING share is bad (red).
+        def _pp_change_color_lower_is_better(val):
             if pd.isna(val):
                 return ""
             if val < 0:
@@ -663,14 +669,23 @@ with tab1:
                 return "color: #E24B4A"   # worsening - bigger share at this slot than last period
             return ""
 
-        pp_cols = ["Peak pp Change", "Standard pp Change", "Off-Peak pp Change"]
+        def _pp_change_color_higher_is_better(val):
+            if pd.isna(val):
+                return ""
+            if val > 0:
+                return "color: #1D9E75"   # improving - more import shifted to off-peak than last period
+            elif val < 0:
+                return "color: #E24B4A"   # worsening - less import at off-peak than last period
+            return ""
+
         pct_cols = ["Peak %", "Standard %", "Off-Peak %"]
 
         styled_shaving = shaving_df.style.format(
             {**{c: "{:.2f}%" for c in pct_cols},
-             **{c: "{:+.2f} pp" for c in pp_cols},
+             **{c: "{:+.2f} pp" for c in ["Peak pp Change", "Standard pp Change", "Off-Peak pp Change"]},
              "Total Grid Import (kWh)": "{:.1f}"}
-        ).map(_pp_change_color, subset=pp_cols)
+        ).map(_pp_change_color_lower_is_better, subset=["Peak pp Change", "Standard pp Change"]
+        ).map(_pp_change_color_higher_is_better, subset=["Off-Peak pp Change"])
 
         st.dataframe(styled_shaving, use_container_width=True, hide_index=True)
 
