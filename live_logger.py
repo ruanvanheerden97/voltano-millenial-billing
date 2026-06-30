@@ -188,13 +188,34 @@ def prune_old_rows(days=7):
 
 # ── Sigenergy API helpers ───────────────────────────────────────────────────────
 
-def get_token() -> str:
-    r = requests.post(
-        f"{API_BASE}/openapi/auth/login/password",
-        json={"username": USERNAME, "password": PASSWORD},
-        timeout=15
-    )
-    body = r.json()
+def get_token(retry_on_failure: bool = True) -> str:
+    try:
+        r = requests.post(
+            f"{API_BASE}/openapi/auth/login/password",
+            json={"username": USERNAME, "password": PASSWORD},
+            timeout=15
+        )
+    except requests.exceptions.Timeout:
+        if retry_on_failure:
+            print("    [get_token]  timeout, retrying once...")
+            time.sleep(3)
+            return get_token(retry_on_failure=False)
+        raise RuntimeError("Auth request timed out twice in a row.")
+
+    try:
+        body = r.json()
+    except json.JSONDecodeError:
+        raw_preview = (r.text or "")[:200]
+        if retry_on_failure:
+            print(f"    [get_token]  status={r.status_code} body_len={len(r.text or '')} "
+                  f"raw={raw_preview!r} - retrying once...")
+            time.sleep(3)
+            return get_token(retry_on_failure=False)
+        raise RuntimeError(
+            f"Auth response not valid JSON after retry: status={r.status_code} "
+            f"raw={raw_preview!r}"
+        )
+
     if body.get("code") != 0:
         raise RuntimeError(f"Auth failed: {body.get('msg')} (code {body.get('code')})")
     d = body["data"]
@@ -225,13 +246,19 @@ def api_get(token: str, path: str, retry_on_failure: bool = True) -> dict | None
     try:
         body = r.json()
     except json.JSONDecodeError:
+        # Log the raw response details so we can tell apart an actually-empty
+        # body, a non-JSON error page, a 5xx, etc. - "Expecting value" alone
+        # doesn't distinguish these.
+        raw_preview = (r.text or "")[:200]
         if retry_on_failure:
-            print(f"    [api_get]  {path} -> empty/invalid response body "
-                  f"(status {r.status_code}), retrying once...")
+            print(f"    [api_get]  {path} -> status={r.status_code} "
+                  f"body_len={len(r.text or '')} raw={raw_preview!r} "
+                  f"- retrying once...")
             time.sleep(3)
             return api_get(token, path, retry_on_failure=False)
-        print(f"    [api_get]  {path} -> empty/invalid response body again "
-              f"on retry (status {r.status_code}), giving up.")
+        print(f"    [api_get]  {path} -> status={r.status_code} "
+              f"body_len={len(r.text or '')} raw={raw_preview!r} "
+              f"- failed again on retry, giving up.")
         return None
 
     if body.get("code") != 0:
