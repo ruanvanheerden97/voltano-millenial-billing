@@ -463,6 +463,8 @@ def compute_grid_import_tou_share(hourly: pd.DataFrame, billing_run_dates: dict)
         df[change_col] = df[col].diff().round(2)
 
     return df
+
+def assign_billing_run(d: pd.Timestamp, runs: dict) -> str:
     """Assign a date to the correct billing run based on end dates."""
     d_date = d.date() if hasattr(d, "date") else d
     for run_name, end_date in sorted(runs.items(), key=lambda x: x[1]):
