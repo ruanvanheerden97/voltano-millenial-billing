@@ -2964,22 +2964,41 @@ with tab6:
         # ── 9D. Per-inverter PV power comparison ───────────────────────────────
         st.subheader("☀️ Per-inverter solar output")
         st.caption(
-            "Each inverter's own reported PV power output, side by side. If one "
-            "inverter consistently produces less than the other two under "
-            "similar daylight conditions, that points to either a string-level "
-            "fault on that inverter or a partial shading/soiling issue specific "
-            "to its panels — see the string-level breakdown below to pinpoint it."
+            "Each inverter's own reported PV power output, plus the SITE TOTAL "
+            "(pv_kw from the live energy flow reading, measured independently "
+            "of the 3 inverters' own self-reports) and the sum of the 3 "
+            "inverters' outputs. If Sum of inverters tracks the Site total "
+            "closely, the inverters' own readings are trustworthy. A gap "
+            "between them points to a whole inverter dropping out or "
+            "misreporting — distinct from the per-string mismatch covered "
+            "below, which only catches faults INSIDE one inverter's own data."
         )
         fig_inv_compare = go.Figure()
         inv_colors = {"inv1_pv_kw": "#EF9F27", "inv2_pv_kw": "#7F77DD", "inv3_pv_kw": "#1D9E75"}
+        inv_cols_present = [c for c in ["inv1_pv_kw", "inv2_pv_kw", "inv3_pv_kw"] if c in hist.columns]
+
         for i, col in enumerate(["inv1_pv_kw", "inv2_pv_kw", "inv3_pv_kw"], start=1):
             if col in hist.columns:
                 fig_inv_compare.add_scatter(
                     x=hist["ts"], y=hist[col], name=f"Inverter {i}",
                     line=dict(color=inv_colors[col], width=2),
                 )
+
+        if inv_cols_present:
+            inv_sum = hist[inv_cols_present].sum(axis=1)
+            fig_inv_compare.add_scatter(
+                x=hist["ts"], y=inv_sum, name="Sum of inverters",
+                line=dict(color="#D85A30", width=2, dash="dot"),
+            )
+
+        if "pv_kw" in hist.columns:
+            fig_inv_compare.add_scatter(
+                x=hist["ts"], y=hist["pv_kw"], name="Site total (independent reading)",
+                line=dict(color="#FFFFFF", width=2.5),
+            )
+
         fig_inv_compare.update_layout(
-            height=320, yaxis=dict(title="kW", rangemode="tozero"),
+            height=340, yaxis=dict(title="kW", rangemode="tozero"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             margin=dict(t=10, b=10, l=10, r=10),
@@ -2987,6 +3006,37 @@ with tab6:
         fig_inv_compare.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
         fig_inv_compare.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
         st.plotly_chart(fig_inv_compare, use_container_width=True)
+
+        # ── Quantify the sum-vs-total gap over the daylight window ────────────
+        if inv_cols_present and "pv_kw" in hist.columns:
+            daylight_compare = hist[hist["irradiance"] > 50] if "irradiance" in hist.columns else hist[hist["pv_kw"] > 0.5]
+            if len(daylight_compare) > 0:
+                avg_sum = daylight_compare[inv_cols_present].sum(axis=1).mean()
+                avg_total = daylight_compare["pv_kw"].mean()
+                if avg_total > 0.05:
+                    site_gap_pct = 100 * (avg_total - avg_sum) / avg_total
+                else:
+                    site_gap_pct = 0.0
+
+                gap_col1, gap_col2, gap_col3 = st.columns(3)
+                gap_col1.metric("Avg sum of inverters", f"{avg_sum:.2f} kW")
+                gap_col2.metric("Avg site total", f"{avg_total:.2f} kW")
+                gap_col3.metric(
+                    "Gap (site total vs. sum)",
+                    f"{site_gap_pct:+.1f}%",
+                    delta_color="off",
+                )
+                if abs(site_gap_pct) > 10:
+                    st.warning(
+                        f"The 3 inverters' own readings sum to {site_gap_pct:+.1f}% "
+                        f"away from the independently-measured site total. This "
+                        f"suggests at least one inverter is under- or "
+                        f"over-reporting its own output, separate from any "
+                        f"single bad string inside it — check the per-inverter "
+                        f"diagnostics table below first to rule out a string-level "
+                        f"cause, then consider whether the energyFlow reading "
+                        f"itself or an inverter's communication link needs checking."
+                    )
 
         # ── 9E. PV string fault detection ───────────────────────────────────────
         st.subheader("🔍 PV string diagnostics — fault & mismatch detection")
