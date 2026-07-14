@@ -1521,8 +1521,7 @@ if tab4:
         # to charge that energy, solar losses cost the opportunity sell rate
         grid_tariff_avg = (row["C Cost (R)"] / c_grid) if c_grid > 0 else 0
         loss_grid_r     = round(loss_grid  * grid_tariff_avg, 2)
-        loss_solar_r    = round(loss_solar * get_sell_rate_for_date(
-            pd.Timestamp(row["Period End"])), 2)
+        loss_solar_r    = round(loss_solar * SELL_RATE, 2)
         loss_total_r    = round(loss_grid_r + loss_solar_r, 2)
 
         rte_status = (
