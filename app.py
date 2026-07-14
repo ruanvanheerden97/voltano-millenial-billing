@@ -14,175 +14,164 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ─── TOU CLASSIFICATION (config-driven, multi-period) ─────────────────────────
-# Schedule and tariff rates are loaded from tou_tariffs.json as a list of
-# PERIODS, each with its own effective_from date. This means when tariffs
-# change each year, a new period is appended — historical data keeps using
-# whichever schedule/rates were in effect at the time, instead of being
-# silently recalculated with the newest rates. See load_tou_config() below.
+# ── Mobile-friendly CSS ────────────────────────────────────────────────────────
+# Makes the app readable and usable on phones/tablets without horizontal
+# scrolling. Keeps full-width layout on desktop untouched.
+st.markdown("""
+<style>
+/* ── Responsive layout ───────────────────────────────────────── */
+@media (max-width: 768px) {
+    /* Remove the fixed padding Streamlit adds, let content fill screen */
+    .block-container { padding: 0.5rem 0.5rem 2rem !important; }
+    /* Stack columns vertically on mobile instead of side by side */
+    [data-testid="column"] { min-width: 100% !important; flex: 100% !important; }
+    /* Make dataframes scrollable horizontally instead of overflowing */
+    [data-testid="stDataFrame"] { overflow-x: auto !important; }
+    /* Smaller headings on small screens */
+    h1 { font-size: 1.4rem !important; }
+    h2 { font-size: 1.2rem !important; }
+    h3 { font-size: 1.0rem !important; }
+    /* Make metric cards stack more naturally */
+    [data-testid="metric-container"] { min-width: 120px !important; }
+    /* Plotly charts: allow horizontal scroll rather than squishing */
+    .js-plotly-plot { overflow-x: auto !important; }
+}
+/* ── Sidebar nav styling ─────────────────────────────────────── */
+[data-testid="stSidebar"] .stRadio label {
+    font-size: 0.95rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 6px;
+    display: block;
+}
+[data-testid="stSidebar"] .stRadio label:hover {
+    background-color: rgba(255,255,255,0.07);
+}
+</style>
+""", unsafe_allow_html=True)
 
-import json as _json_tou
-import bisect as _bisect_tou
-
-@st.cache_data
-def load_tou_config() -> dict:
-    """Load TOU periods from tou_tariffs.json, sorted by effective_from."""
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tou_tariffs.json")
-    if not os.path.exists(config_path):
-        st.error(
-            "tou_tariffs.json not found. This file defines the TOU time slots "
-            "and tariff rates — the app cannot calculate billing without it."
-        )
-        st.stop()
-    with open(config_path) as f:
-        raw = _json_tou.load(f)
-    periods = sorted(raw["periods"], key=lambda p: p["effective_from"])
-    return periods
-
-TOU_PERIODS = load_tou_config()
-_TOU_PERIOD_STARTS = [pd.Timestamp(p["effective_from"]) for p in TOU_PERIODS]
-
-# Most recent period's rates are used for "current" displays (e.g. live tab).
-# Kept for backward compatibility with code that references TARIFF/SELL_RATE directly.
-TARIFF    = TOU_PERIODS[-1]["tariffs_rkwh"]
-SELL_RATE = TOU_PERIODS[-1]["sell_rate_rkwh"]
-
-def get_period_for_date(dt) -> dict:
-    """Return the tariff period dict that was in effect on the given date.
-    Strips timezone info before comparing, since _TOU_PERIOD_STARTS are
-    timezone-naive (parsed from plain date strings in tou_tariffs.json),
-    while callers like the live dashboard may pass timezone-aware datetimes."""
-    d = pd.Timestamp(dt)
-    if d.tzinfo is not None:
-        d = d.tz_localize(None)
-    idx = _bisect_tou.bisect_right(_TOU_PERIOD_STARTS, d) - 1
-    idx = max(0, min(idx, len(TOU_PERIODS) - 1))
-    return TOU_PERIODS[idx]
+# ─── TOU CLASSIFICATION ───────────────────────────────────────────────────────
 
 def get_season(dt):
-    """Return 'high' or 'low' demand season, using the period in effect on dt."""
-    period = get_period_for_date(dt)
-    return "high" if dt.month in period["season_months"]["high"] else "low"
-
-def _hour_in_ranges(h, ranges):
-    """Check if hour h falls in any [start, end) range from the config."""
-    return any(start <= h < end for start, end in ranges)
+    """Return 'high' (Jun-Aug) or 'low' (Sep-May) demand season."""
+    return "high" if dt.month in [6, 7, 8] else "low"
 
 def get_tou_slot(dt):
     """
-    Classify a datetime into Peak (1.8.1), Standard (1.8.2), or Off-Peak (1.8.3),
-    using whichever tariff period (schedule) was in effect on that date.
+    Classify a datetime into Peak (1.8.1), Standard (1.8.2), or Off-Peak (1.8.3).
+    Returns the register string: '1.8.1', '1.8.2', or '1.8.3'
+    Based on Eskom TOU tariff schedule.
     """
-    period = get_period_for_date(dt)
-    season = "high" if dt.month in period["season_months"]["high"] else "low"
+    season = get_season(dt)
     dow = dt.weekday()   # 0=Mon, 5=Sat, 6=Sun
-    h = dt.hour
+    h = dt.hour          # hour of day (0-23), represents the hour STARTING at that time
 
+    # ── SUNDAY (all seasons) ──────────────────────────────────────
     if dow == 6:
-        day_type = "sunday"
+        if season == "low":
+            if 18 <= h < 20:
+                return "1.8.2"
+            else:
+                return "1.8.3"
+        else:  # high
+            if 17 <= h < 19:
+                return "1.8.2"
+            else:
+                return "1.8.3"
+
+    # ── SATURDAY ─────────────────────────────────────────────────
     elif dow == 5:
-        day_type = "saturday"
+        if season == "low":
+            if h < 7 or h >= 20:
+                return "1.8.3"
+            elif 7 <= h < 12 or 18 <= h < 20:
+                return "1.8.2"
+            else:  # 12:00-18:00
+                return "1.8.3"
+        else:  # high
+            if h < 7 or h >= 19:
+                return "1.8.3"
+            elif 7 <= h < 12 or 17 <= h < 19:
+                return "1.8.2"
+            else:  # 12:00-17:00
+                return "1.8.3"
+
+    # ── WEEKDAY (Mon-Fri) ────────────────────────────────────────
     else:
-        day_type = "weekday"
-
-    slots = period["schedule"][day_type][season]
-    if "peak" in slots and _hour_in_ranges(h, slots["peak"]):
-        return "1.8.1"
-    if "standard" in slots and _hour_in_ranges(h, slots["standard"]):
-        return "1.8.2"
-    return "1.8.3"
-
-def get_tariff_for_date(dt, tou_slot: str) -> float:
-    """Return the R/kWh rate for a given datetime + TOU slot, using the
-    period that was in effect on that date. Use this instead of TARIFF[s][t]
-    directly anywhere a specific date is involved."""
-    period = get_period_for_date(dt)
-    season = "high" if dt.month in period["season_months"]["high"] else "low"
-    return period["tariffs_rkwh"][season][tou_slot]
-
-def get_sell_rate_for_date(dt) -> float:
-    """Return the flat sell rate (R/kWh) in effect on the given date."""
-    return get_period_for_date(dt)["sell_rate_rkwh"]
+        if season == "low":
+            if h < 6 or h >= 22:
+                return "1.8.3"
+            elif h == 6 or (9 <= h < 18) or (21 <= h < 22):
+                return "1.8.2"
+            elif (7 <= h < 9) or (18 <= h < 21):
+                return "1.8.1"
+            else:
+                return "1.8.2"
+        else:  # high
+            if h < 6 or h >= 22:
+                return "1.8.3"
+            elif (8 <= h < 17) or (20 <= h < 22):
+                return "1.8.2"
+            elif (6 <= h < 8) or (17 <= h < 20):
+                return "1.8.1"
+            else:
+                return "1.8.2"
 
 
 def assign_tou_vectorised(hourly: pd.DataFrame) -> pd.DataFrame:
     """
-    Fully vectorised TOU slot, season, and tariff assignment, period-aware.
-    Adds columns: tou_slot, season, tariff_rkwh, sell_rate_rkwh.
-    Rows are grouped by which tariff period they fall under (by effective_from
-    date) BEFORE the TOU schedule is applied, so historical rows always use
-    the schedule/rates that were actually in effect at the time — even after
-    a new tariff period is added to tou_tariffs.json for a later year.
+    Fully vectorised TOU slot and season assignment — no row-by-row apply().
+    ~50× faster than apply(get_tou_slot) on large datasets.
     """
-    hourly = hourly.copy()
     dt  = hourly["datetime"]
     h   = dt.dt.hour
-    dow = dt.dt.weekday          # 0=Mon ... 6=Sun
+    dow = dt.dt.weekday          # 0=Mon … 6=Sun
     mon = dt.dt.month
 
-    period_starts_arr = np.array(_TOU_PERIOD_STARTS, dtype="datetime64[ns]")
-    dt_arr = dt.values.astype("datetime64[ns]")
-    period_idx = np.clip(
-        np.searchsorted(period_starts_arr, dt_arr, side="right") - 1,
-        0, len(TOU_PERIODS) - 1
+    season = pd.Series(
+        np.where(mon.isin([6, 7, 8]), "high", "low"),
+        index=hourly.index
     )
 
-    hourly["tou_slot"]      = "1.8.3"
-    hourly["season"]        = ""
-    hourly["tariff_rkwh"]   = 0.0
-    hourly["sell_rate_rkwh"] = 0.0
-
+    is_high    = season == "high"
     is_weekday = dow < 5
     is_sat     = dow == 5
     is_sun     = dow == 6
 
-    for p_idx, period in enumerate(TOU_PERIODS):
-        in_period = period_idx == p_idx
-        if not in_period.any():
-            continue
+    # Start everything as Off-Peak then overwrite in priority order
+    slot = pd.Series("1.8.3", index=hourly.index)
 
-        is_high = mon.isin(period["season_months"]["high"]) & in_period
-        is_low  = in_period & ~is_high
-        hourly.loc[is_high, "season"] = "high"
-        hourly.loc[is_low, "season"]  = "low"
-        hourly.loc[in_period, "sell_rate_rkwh"] = period["sell_rate_rkwh"]
+    # ── SUNDAY ────────────────────────────────────────────────────
+    std_sun = is_sun & (
+        (~is_high & h.between(18, 19)) |
+        (is_high  & h.between(17, 18))
+    )
+    slot = slot.where(~std_sun, "1.8.2")
 
-        day_type_masks = [
-            ("sunday", is_sun & in_period),
-            ("saturday", is_sat & in_period),
-            ("weekday", is_weekday & in_period),
-        ]
-        season_masks = [("low", is_low), ("high", is_high)]
+    # ── SATURDAY ──────────────────────────────────────────────────
+    std_sat = is_sat & (
+        (~is_high & (h.between(7, 11)  | h.between(18, 19))) |
+        (is_high  & (h.between(7, 11)  | h.between(17, 18)))
+    )
+    slot = slot.where(~std_sat, "1.8.2")
 
-        for day_type, day_mask in day_type_masks:
-            if not day_mask.any():
-                continue
-            for season_name, season_mask in season_masks:
-                base_mask = day_mask & season_mask
-                if not base_mask.any():
-                    continue
-                slots_cfg = period["schedule"][day_type][season_name]
+    # ── WEEKDAY ───────────────────────────────────────────────────
+    # Standard
+    std_wd = is_weekday & (
+        (~is_high & ((h == 6) | h.between(9, 17) | (h == 21))) |
+        (is_high  & (h.between(8, 16) | h.between(20, 21)))
+    )
+    slot = slot.where(~std_wd, "1.8.2")
 
-                if "standard" in slots_cfg:
-                    std_mask = pd.Series(False, index=hourly.index)
-                    for start, end in slots_cfg["standard"]:
-                        std_mask = std_mask | h.between(start, end - 1)
-                    hourly.loc[base_mask & std_mask, "tou_slot"] = "1.8.2"
+    # Peak (overwrites standard where applicable)
+    peak_wd = is_weekday & (
+        (~is_high & (h.between(7, 8)  | h.between(18, 20))) |
+        (is_high  & (h.between(6, 7)  | h.between(17, 19)))
+    )
+    slot = slot.where(~peak_wd, "1.8.1")
 
-                if "peak" in slots_cfg:
-                    peak_mask = pd.Series(False, index=hourly.index)
-                    for start, end in slots_cfg["peak"]:
-                        peak_mask = peak_mask | h.between(start, end - 1)
-                    hourly.loc[base_mask & peak_mask, "tou_slot"] = "1.8.1"
-
-        # Assign tariff rate per row based on season + tou_slot, within this period only
-        for season_name in ["low", "high"]:
-            for slot_code in ["1.8.1", "1.8.2", "1.8.3"]:
-                mask = in_period & (hourly["season"] == season_name) & (hourly["tou_slot"] == slot_code)
-                if mask.any():
-                    rate = period["tariffs_rkwh"][season_name][slot_code]
-                    hourly.loc[mask, "tariff_rkwh"] = rate
-
+    hourly = hourly.copy()
+    hourly["tou_slot"] = slot
+    hourly["season"]   = season
     return hourly
 
 # ─── DATA LOADING ─────────────────────────────────────────────────────────────
@@ -361,6 +350,21 @@ with st.sidebar:
     st.header("⚙️ Settings")
     show_raw = st.checkbox("Show raw hourly data", value=False)
 
+    st.divider()
+    st.header("📌 Navigation")
+    page = st.radio(
+        "Go to",
+        options=[
+            "🔢 Meter Readings",
+            "📊 System Performance",
+            "💰 Profitability",
+            "🔋 Battery Health",
+            "🌤️ Seasonal Patterns",
+            "⚡ Live Dashboard",
+        ],
+        label_visibility="collapsed",
+    )
+
 # ── Load ───────────────────────────────────────────────────────────────────────
 with st.spinner("Loading data..."):
     daily, hourly = load_data(DATA_FILE)
@@ -390,80 +394,6 @@ billing_runs = load_billing_runs_config()
 
 # Re-assign billing_run column in daily data using the JSON config
 # so sorting and grouping is always correct
-def compute_grid_import_tou_share(hourly: pd.DataFrame, billing_run_dates: dict) -> pd.DataFrame:
-    """
-    For each billing run, compute what % of TOTAL grid import (kWh) fell into
-    each TOU slot (Peak / Standard / Off-Peak). This is %-based rather than
-    raw kWh because total load and total solar generation both change over
-    time (new appliances, seasonal variation, panel degradation, etc.) - a
-    rising kWh of peak import could just mean "the site uses more power now",
-    whereas a rising % of peak import specifically means "the battery
-    strategy is shifting less of the load away from peak than it used to".
-
-    This is the right metric to judge whether the battery dispatch strategy
-    (charge off-peak/solar, discharge at peak on weekdays and into the
-    weekend standard windows) is actually working, independent of how much
-    the site's overall consumption has grown or shrunk.
-
-    Returns a DataFrame with one row per billing run:
-      Period, Period Start, Period End, Total Grid Import (kWh),
-      Peak %, Standard %, Off-Peak %,
-      Peak pp Change, Standard pp Change, Off-Peak pp Change
-    (pp = percentage points vs. the immediately preceding billing run -
-    NOT vs. the same row's own kWh, since these are share-of-total deltas)
-    """
-    start_date = pd.Timestamp("2025-12-05")
-    sorted_runs = sorted(billing_run_dates.items(), key=lambda x: x[1])
-    rows = []
-
-    for i, (billing_run, end_date) in enumerate(sorted_runs):
-        if i == 0:
-            period_start = start_date
-        else:
-            prev_end = sorted_runs[i - 1][1]
-            period_start = prev_end + pd.Timedelta(days=1)
-
-        mask = (
-            (hourly["datetime"] >= period_start) &
-            (hourly["datetime"] < end_date + pd.Timedelta(days=1))
-        )
-        period = hourly[mask]
-
-        total_import = period["grid_import_kwh"].sum()
-        peak_import    = period[period["tou_slot"] == "1.8.1"]["grid_import_kwh"].sum()
-        std_import     = period[period["tou_slot"] == "1.8.2"]["grid_import_kwh"].sum()
-        offpeak_import = period[period["tou_slot"] == "1.8.3"]["grid_import_kwh"].sum()
-
-        if total_import > 0:
-            peak_pct    = round(100 * peak_import / total_import, 2)
-            std_pct     = round(100 * std_import / total_import, 2)
-            offpeak_pct = round(100 * offpeak_import / total_import, 2)
-        else:
-            peak_pct = std_pct = offpeak_pct = 0.0
-
-        rows.append({
-            "Billing Run":              billing_run,
-            "Period Start":             period_start.date(),
-            "Period End":               end_date.date(),
-            "Total Grid Import (kWh)":  round(total_import, 1),
-            "Peak %":                   peak_pct,
-            "Standard %":               std_pct,
-            "Off-Peak %":               offpeak_pct,
-        })
-
-    df = pd.DataFrame(rows)
-
-    # Month-over-month change in percentage points (this row's % minus the
-    # previous row's %) - this is the "are we shaving more or less than last
-    # period" signal. Positive Peak pp Change = a BIGGER share of grid import
-    # is now happening at peak than last period (worse shaving). Negative =
-    # smaller share at peak (better shaving).
-    for col in ["Peak %", "Standard %", "Off-Peak %"]:
-        change_col = col.replace(" %", " pp Change")
-        df[change_col] = df[col].diff().round(2)
-
-    return df
-
 def assign_billing_run(d: pd.Timestamp, runs: dict) -> str:
     """Assign a date to the correct billing run based on end dates."""
     d_date = d.date() if hasattr(d, "date") else d
@@ -476,23 +406,26 @@ daily["billing_run"] = daily["date"].apply(lambda d: assign_billing_run(d, billi
 daily = daily.sort_values("date").reset_index(drop=True)
 
 # ─── TARIFF CONSTANTS ─────────────────────────────────────────────────────────
-# TARIFF and SELL_RATE are loaded from tou_tariffs.json near the top of this
-# file (see load_tou_config()). Edit that JSON file to update rates each year.
+TARIFF = {
+    "low":  {"1.8.1": 3.1682, "1.8.2": 2.5487, "1.8.3": 1.4826},
+    "high": {"1.8.1": 5.9163, "1.8.2": 1.9068, "1.8.3": 1.1100},
+}
+SELL_RATE = 3.2795  # R/kWh — flat sell rate regardless of season/TOU
 
-# ─── TABS ─────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🔢 Meter Readings",
-    "📊 System Performance",
-    "💰 Profitability",
-    "🔋 Battery Health",
-    "🌤️ Seasonal Patterns",
-    "⚡ Live Dashboard",
-])
+# ─── PAGE ROUTING ─────────────────────────────────────────────────────────────
+# Navigation is handled by the sidebar radio above; each page renders only
+# when selected, keeping the app fast and sidebar-friendly on mobile.
+tab1 = page == "🔢 Meter Readings"
+tab2 = page == "📊 System Performance"
+tab3 = page == "💰 Profitability"
+tab4 = page == "🔋 Battery Health"
+tab5 = page == "🌤️ Seasonal Patterns"
+tab6 = page == "⚡ Live Dashboard"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — METER READINGS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab1:
+if tab1:
     st.subheader("Virtual Meter — TOU Breakdown")
 
     # ── Controls row ──────────────────────────────────────────────────────────
@@ -636,129 +569,135 @@ with tab1:
         )
         st.plotly_chart(fig_trend, use_container_width=True)
 
-    # ── Peak/Standard Shaving Effectiveness ────────────────────────────────────
+    # ── Date lookup ───────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("⚖️ Peak/Standard Shaving Effectiveness")
+    st.subheader("🔍 Date lookup — hourly readings for a specific day")
     st.caption(
-        "What % of total GRID IMPORT falls into each TOU slot, per billing period. "
-        "This is %-based rather than raw kWh because total load and solar generation "
-        "both change over time — a falling **% share at Peak/Standard** means the battery "
-        "strategy is genuinely shifting more consumption away from expensive hours, "
-        "independent of whether the site is using more or less power overall. "
-        "The 'pp Change' columns show the percentage-point shift vs. the immediately "
-        "preceding billing run. For **Peak** and **Standard**, negative is good (shrinking "
-        "share of expensive import) and positive is bad. For **Off-Peak**, it's the mirror "
-        "image — positive is good (more import successfully shifted to the cheapest hours) "
-        "and negative is bad."
+        "Select a date to see every hourly reading imported for that day, "
+        "broken down by TOU slot. Useful for verifying a specific day's data "
+        "or investigating a spike/anomaly you noticed in the billing totals."
     )
 
-    shaving_df = compute_grid_import_tou_share(hourly, billing_runs)
+    avail_dates = sorted(hourly["datetime"].dt.date.unique())
+    if avail_dates:
+        date_col1, date_col2 = st.columns([2, 2])
+        with date_col1:
+            selected_date = st.date_input(
+                "Select date",
+                value=avail_dates[-1],
+                min_value=avail_dates[0],
+                max_value=avail_dates[-1],
+                help="Only dates with imported data are selectable.",
+            )
+        with date_col2:
+            lookup_col_label = st.selectbox(
+                "Energy channel",
+                options=list(METER_COLUMNS.keys()),
+                index=list(METER_COLUMNS.keys()).index(selected_label),
+                key="lookup_meter",
+                help="Defaults to the same channel selected above.",
+            )
+        lookup_col = METER_COLUMNS[lookup_col_label]
 
-    if len(shaving_df) > 0:
-        # Color logic differs by slot: for Peak/Standard, a SHRINKING share is
-        # good (green) and a GROWING share is bad (red) - we want less import
-        # at expensive hours. For Off-Peak, it's the mirror image: a GROWING
-        # share is good (green) since that import shifted away from
-        # Peak/Standard, and a SHRINKING share is bad (red).
-        def _pp_change_color_lower_is_better(val):
-            if pd.isna(val):
-                return ""
-            if val < 0:
-                return "color: #1D9E75"   # improving - smaller share at this slot than last period
-            elif val > 0:
-                return "color: #E24B4A"   # worsening - bigger share at this slot than last period
-            return ""
+        day_data = hourly[hourly["datetime"].dt.date == selected_date].copy()
 
-        def _pp_change_color_higher_is_better(val):
-            if pd.isna(val):
-                return ""
-            if val > 0:
-                return "color: #1D9E75"   # improving - more import shifted to off-peak than last period
-            elif val < 0:
-                return "color: #E24B4A"   # worsening - less import at off-peak than last period
-            return ""
+        if day_data.empty:
+            st.info(f"No data available for {selected_date}.")
+        else:
+            day_data = day_data.sort_values("datetime").reset_index(drop=True)
 
-        pct_cols = ["Peak %", "Standard %", "Off-Peak %"]
+            # Build the display table
+            lookup_df = pd.DataFrame({
+                "Time": day_data["datetime"].dt.strftime("%H:%M"),
+                "TOU Slot": day_data["tou_slot"].map(
+                    {"1.8.1": "🔴 Peak", "1.8.2": "🟡 Standard", "1.8.3": "🟢 Off-Peak"}
+                ),
+                "Season": day_data["season"].str.capitalize(),
+                lookup_col_label + " (kWh)": day_data[lookup_col].round(4),
+                "Running total (kWh)": day_data[lookup_col].cumsum().round(4),
+            })
 
-        styled_shaving = shaving_df.style.format(
-            {**{c: "{:.2f}%" for c in pct_cols},
-             **{c: "{:+.2f} pp" for c in ["Peak pp Change", "Standard pp Change", "Off-Peak pp Change"]},
-             "Total Grid Import (kWh)": "{:.1f}"}
-        ).map(_pp_change_color_lower_is_better, subset=["Peak pp Change", "Standard pp Change"]
-        ).map(_pp_change_color_higher_is_better, subset=["Off-Peak pp Change"])
+            # Summary row stats
+            day_total = day_data[lookup_col].sum()
+            peak_total    = day_data[day_data["tou_slot"] == "1.8.1"][lookup_col].sum()
+            std_total     = day_data[day_data["tou_slot"] == "1.8.2"][lookup_col].sum()
+            offpeak_total = day_data[day_data["tou_slot"] == "1.8.3"][lookup_col].sum()
+            billing_run   = day_data["billing_run"].iloc[0] if "billing_run" in day_data.columns else "—"
 
-        st.dataframe(styled_shaving, use_container_width=True, hide_index=True)
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Date", str(selected_date))
+            m2.metric("Billing run", billing_run)
+            m3.metric("🔴 Peak", f"{peak_total:.3f} kWh")
+            m4.metric("🟡 Standard", f"{std_total:.3f} kWh")
+            m5.metric("🟢 Off-Peak", f"{offpeak_total:.3f} kWh")
 
-        # Download
-        shaving_csv = shaving_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download shaving effectiveness CSV",
-            shaving_csv,
-            file_name=f"{site_name}_grid_import_tou_share.csv",
-            mime="text/csv",
-        )
+            # Colour rows by TOU slot
+            def _tou_row_color(row):
+                colors = {
+                    "🔴 Peak":     "background-color: rgba(226,75,74,0.12)",
+                    "🟡 Standard": "background-color: rgba(239,159,39,0.12)",
+                    "🟢 Off-Peak": "background-color: rgba(29,158,117,0.12)",
+                }
+                return [colors.get(row["TOU Slot"], "")] * len(row)
 
-        # ── Trend chart: % share by TOU slot over billing periods ─────────────
-        fig_shaving = go.Figure()
-        fig_shaving.add_scatter(
-            x=shaving_df["Billing Run"], y=shaving_df["Peak %"],
-            mode="lines+markers", name="Peak %",
-            line=dict(color="#E24B4A", width=2), marker=dict(size=7),
-        )
-        fig_shaving.add_scatter(
-            x=shaving_df["Billing Run"], y=shaving_df["Standard %"],
-            mode="lines+markers", name="Standard %",
-            line=dict(color="#EF9F27", width=2), marker=dict(size=7),
-        )
-        fig_shaving.add_scatter(
-            x=shaving_df["Billing Run"], y=shaving_df["Off-Peak %"],
-            mode="lines+markers", name="Off-Peak %",
-            line=dict(color="#1D9E75", width=2), marker=dict(size=7),
-        )
-        fig_shaving.update_layout(
-            xaxis_title="Billing Run",
-            yaxis_title="% of Total Grid Import",
-            yaxis=dict(range=[0, 100]),
-            legend_title="TOU Slot",
-            height=380,
-            title="Grid Import Share by TOU Slot — Trend Across Billing Periods",
-        )
-        st.plotly_chart(fig_shaving, use_container_width=True)
+            st.dataframe(
+                lookup_df.style.apply(_tou_row_color, axis=1),
+                use_container_width=True,
+                hide_index=True,
+                height=420,
+            )
 
-        # ── Latest period vs. previous period summary callout ─────────────────
-        if len(shaving_df) >= 2:
-            latest = shaving_df.iloc[-1]
-            prev   = shaving_df.iloc[-2]
-            peak_change = latest["Peak pp Change"]
-            std_change  = latest["Standard pp Change"]
+            # Hourly bar chart for the selected day, coloured by TOU slot
+            bar_colors = day_data["tou_slot"].map(
+                {"1.8.1": "#E24B4A", "1.8.2": "#EF9F27", "1.8.3": "#1D9E75"}
+            )
+            fig_day = go.Figure()
+            fig_day.add_bar(
+                x=day_data["datetime"].dt.strftime("%H:%M"),
+                y=day_data[lookup_col],
+                marker_color=bar_colors,
+                text=day_data["tou_slot"].map(
+                    {"1.8.1": "Peak", "1.8.2": "Std", "1.8.3": "OffPk"}
+                ),
+                textposition="outside",
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    + lookup_col_label + ": %{y:.4f} kWh<br>"
+                    "<extra></extra>"
+                ),
+            )
+            fig_day.update_layout(
+                height=320,
+                xaxis_title="Hour",
+                yaxis_title=f"{lookup_col_label} (kWh)",
+                showlegend=False,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=10, b=10),
+                title=f"{lookup_col_label} — {selected_date}  |  "
+                      f"Total: {day_total:.3f} kWh  "
+                      f"(Peak {peak_total:.3f} / Std {std_total:.3f} / OffPk {offpeak_total:.3f})",
+            )
+            fig_day.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+            fig_day.update_yaxes(gridcolor="rgba(255,255,255,0.06)", rangemode="tozero")
+            st.plotly_chart(fig_day, use_container_width=True)
 
-            summary_col1, summary_col2 = st.columns(2)
-            with summary_col1:
-                if pd.notna(peak_change):
-                    direction = "improved" if peak_change < 0 else "worsened" if peak_change > 0 else "held steady"
-                    st.metric(
-                        f"Peak Share — {latest['Billing Run']} vs {prev['Billing Run']}",
-                        f"{latest['Peak %']:.2f}%",
-                        delta=f"{peak_change:+.2f} pp ({direction})",
-                        delta_color="inverse",  # negative (smaller peak share) shown as "good" green
-                    )
-            with summary_col2:
-                if pd.notna(std_change):
-                    direction = "improved" if std_change < 0 else "worsened" if std_change > 0 else "held steady"
-                    st.metric(
-                        f"Standard Share — {latest['Billing Run']} vs {prev['Billing Run']}",
-                        f"{latest['Standard %']:.2f}%",
-                        delta=f"{std_change:+.2f} pp ({direction})",
-                        delta_color="inverse",
-                    )
+            # Download this day's data
+            day_csv = lookup_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                f"⬇️ Download {selected_date} hourly data",
+                day_csv,
+                file_name=f"{site_name}_{lookup_col}_{selected_date}.csv",
+                mime="text/csv",
+            )
     else:
-        st.info("No billing run data available yet to calculate shaving effectiveness.")
+        st.info("No hourly data loaded yet.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — SYSTEM PERFORMANCE
 # ══════════════════════════════════════════════════════════════════════════════
-with tab2:
+if tab2:
     st.subheader("System Performance Overview")
 
     # ── Date range slider ─────────────────────────────────────────────────────
@@ -833,13 +772,13 @@ with tab2:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PROFITABILITY
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+if tab3:
     st.subheader("Revenue & Profitability")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PROFITABILITY
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+if tab3:
     st.subheader("💰 Profitability Analysis")
     st.caption("All calculations derived from actual metered data and your input parameters — not from the inverter revenue column.")
 
@@ -996,9 +935,13 @@ with tab3:
     h["solar_to_batt"] = np.minimum(h["batt_charge_kwh"], h["solar_kwh"])
     h["grid_to_batt"]  = np.maximum(0.0, h["batt_charge_kwh"] - h["solar_kwh"])
 
-    # Per-row tariff already assigned by assign_tou_vectorised() using the
-    # correct period for each row's date — no date-blind lookup needed.
-    h["slot_tariff"] = h["tariff_rkwh"]
+    # Vectorised tariff lookup
+    _tmap = {(s, t): TARIFF[s][t]
+             for s in ["low", "high"] for t in ["1.8.1", "1.8.2", "1.8.3"]}
+    h["slot_tariff"] = pd.Series(
+        [_tmap[(s, t)] for s, t in zip(h["season"], h["tou_slot"])],
+        index=h.index
+    )
 
     is_weekday_h = h["datetime"].dt.weekday < 5
 
@@ -1015,17 +958,8 @@ with tab3:
 
     # Stream 1 revenue: 15% of slot tariff for grid-discharge kWh
     # Cost recovery: off-peak tariff paid to municipality
-    # Per-row off-peak/standard tariffs, date-aware (vectorised via period+season groups)
-    offpeak_tariff_h = pd.Series(0.0, index=h.index)
-    std_tariff_h     = pd.Series(0.0, index=h.index)
-    for period in TOU_PERIODS:
-        p_start = pd.Timestamp(period["effective_from"])
-        p_mask = h["datetime"] >= p_start
-        # Narrow to just this period's rows (later periods will overwrite earlier ones below)
-        for season_name in ["low", "high"]:
-            s_mask = p_mask & (h["season"] == season_name)
-            offpeak_tariff_h = offpeak_tariff_h.where(~s_mask, period["tariffs_rkwh"][season_name]["1.8.3"])
-            std_tariff_h     = std_tariff_h.where(~s_mask, period["tariffs_rkwh"][season_name]["1.8.2"])
+    offpeak_tariff_h = h["season"].map({"low": TARIFF["low"]["1.8.3"], "high": TARIFF["high"]["1.8.3"]})
+    std_tariff_h     = h["season"].map({"low": TARIFF["low"]["1.8.2"], "high": TARIFF["high"]["1.8.2"]})
 
     h["rev_grid_disc"]  = h["disc_from_grid"]  * h["slot_tariff"] * batt_margin
     h["cost_grid_charge"]= h["grid_to_batt"]   * offpeak_tariff_h   # what you paid municipality
@@ -1039,7 +973,7 @@ with tab3:
     # Stream 3: Solar → direct load or grid export (not going into battery)
     # Solar available for export/direct = total solar − solar_to_batt
     h["solar_direct"]   = np.maximum(0.0, h["solar_kwh"] - h["solar_to_batt"])
-    h["rev_solar_direct"]= h["solar_direct"] * h["sell_rate_rkwh"]
+    h["rev_solar_direct"]= h["solar_direct"] * SELL_RATE
     h["cost_solar_direct"]= h["solar_direct"] * solar_kwh_cost
 
     # Body corporate levy — 8% of ALL solar at sell rate (deducted from total)
@@ -1080,10 +1014,7 @@ with tab3:
 
         solar_total     = seg["solar_kwh"].sum()
         bc_kwh          = solar_total * bc_rate
-        # Body corporate cost uses each row's own sell rate, weighted by its
-        # share of solar — correct even if this billing run spans a tariff
-        # period boundary (e.g. an April rate change mid-run).
-        bc_cost_r       = (seg["solar_kwh"] * bc_rate * seg["sell_rate_rkwh"]).sum()
+        bc_cost_r       = bc_kwh * SELL_RATE
 
         rev_grid        = seg["rev_grid_disc"].sum()
         rev_solar_disc  = seg["rev_solar_disc"].sum()
@@ -1332,7 +1263,7 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — BATTERY HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+if tab4:
     st.subheader("Battery Health & Cycle Tracking")
 
     # ── Battery parameters ────────────────────────────────────────────────────
@@ -1395,16 +1326,24 @@ with tab4:
             "Scheduled", "Unscheduled"
         )
 
-        # ── Per-row tariff for grid charge cost (already date-aware) ─────────
-        # tariff_rkwh and sell_rate_rkwh are assigned by assign_tou_vectorised()
-        # using the correct period for each row's date.
-        df["tou_tariff"] = df["tariff_rkwh"]
+        # ── Vectorised tariff lookup for grid charge cost ─────────────────────
+        # Build a tariff series from season + tou_slot without apply()
+        tariff_map = {
+            ("low",  "1.8.1"): TARIFF["low"]["1.8.1"],
+            ("low",  "1.8.2"): TARIFF["low"]["1.8.2"],
+            ("low",  "1.8.3"): TARIFF["low"]["1.8.3"],
+            ("high", "1.8.1"): TARIFF["high"]["1.8.1"],
+            ("high", "1.8.2"): TARIFF["high"]["1.8.2"],
+            ("high", "1.8.3"): TARIFF["high"]["1.8.3"],
+        }
+        tariff_key           = list(zip(df["season"], df["tou_slot"]))
+        df["tou_tariff"]     = pd.Series([tariff_map[k] for k in tariff_key], index=df.index)
 
         df["grid_charge_cost_r"]  = df["grid_to_battery"]  * df["tou_tariff"]
         df["solar_charge_cost_r"] = df["solar_to_battery"] * solar_cost
         df["charge_cost_r"]       = df["grid_charge_cost_r"] + df["solar_charge_cost_r"]
 
-        df["discharge_value_r"] = df["batt_discharge_kwh"] * df["sell_rate_rkwh"]
+        df["discharge_value_r"] = df["batt_discharge_kwh"] * SELL_RATE
         df["net_benefit_r"]     = df["discharge_value_r"] - df["charge_cost_r"]
 
         return df
@@ -1790,7 +1729,7 @@ with tab4:
     db1, db2, db3, db4 = st.columns(4)
     db1.metric("Total Discharge (kWh)",  f"{total_disc_kwh:,.1f} kWh")
     db2.metric("Discharge Value",        f"R {total_disc_value_r:,.2f}",
-               help=f"Calculated using each row's own period sell rate (currently R{SELL_RATE}/kWh)")
+               help=f"At flat sell rate of R{SELL_RATE}/kWh")
     db3.metric("Total Charge Cost",      f"R {total_charge_cost_r:,.2f}",
                help=f"Grid TOU tariff + Solar R{solar_cost_per_kwh:.4f}/kWh")
     db4.metric("Net Battery Benefit",    f"R {net_benefit_r:,.2f}",
@@ -1977,7 +1916,7 @@ with tab4:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — SEASONAL PATTERNS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab5:
+if tab5:
     st.subheader("Seasonal Patterns & Weather Influence")
 
     daily["month"]        = daily["date"].dt.month
@@ -2129,187 +2068,222 @@ with tab5:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — LIVE DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
-with tab6:
+if tab6:
     import requests as _requests
     import sqlite3
+    import json as _json_live
+    import time as _time
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
-    # Umhlanga coordinates - used only for the free Open-Meteo forecast call
-    # below (Section 4). This is NOT the Sigenergy API and has no meaningful
-    # rate limit, so it's fine to call directly on every tab render.
-    LAT, LON = -29.7215, 31.0498
+    # ── Credentials (Streamlit Cloud secrets or local .env) ───────────────────
+    def _get_secret(key, default=None):
+        try:
+            return st.secrets[key]
+        except Exception:
+            return os.getenv(key, default)
 
-    # ── DB path (shared with live_logger.py on the Pi) ────────────────────────
-    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_readings.db")
+    LIVE_API_BASE    = _get_secret("SIGEN_API_BASE", "https://openapi-eu.sigencloud.com")
+    LIVE_SYSTEM_ID   = _get_secret("SIGEN_SYSTEM_ID", "HUCUD1764140703")
+    LIVE_USERNAME    = _get_secret("SIGEN_USERNAME")
+    LIVE_PASSWORD    = _get_secret("SIGEN_PASSWORD")
+    LIVE_INVERTER_SN = _get_secret("SIGEN_INVERTER_SN", "110B1K500388")
+    LAT, LON         = -29.7215, 31.0498
+    DB_PATH          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_readings.db")
 
-    # ── CSV fallback paths ─────────────────────────────────────────────────────
-    # When this app runs on Streamlit Cloud, it has no access to the Pi's
-    # local live_readings.db at all - that file only exists on the Pi's disk.
-    # hourly_export_push.sh (cron, on the Pi) exports the DB to these two CSVs
-    # and pushes them to GitHub every hour, so Streamlit Cloud can show
-    # reasonably fresh (up to ~1hr old) data instead of nothing. The Pi-hosted
-    # version of this app always prefers the live DB (true 5-min freshness)
-    # and only falls back to CSV if the DB is genuinely missing.
-    LATEST_CSV_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_latest.csv")
-    HISTORY_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_history.csv")
+    # ── SQLite ────────────────────────────────────────────────────────────────
+    def init_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS live_readings (
+                ts           TEXT PRIMARY KEY,
+                pv_kw        REAL, grid_kw      REAL,
+                load_kw      REAL, battery_kw   REAL,
+                battery_soc  REAL, cloud_cover  REAL,
+                irradiance   REAL, temperature  REAL,
+                pv_daily_kwh REAL, pv_month_kwh REAL,
+                pv_year_kwh  REAL, pv_life_kwh  REAL,
+                inv_temp     REAL, inv_pv_kw    REAL,
+                bat_dischd   REAL, co2_saved    REAL,
+                coal_saved   REAL, trees        REAL
+            )
+        """)
+        conn.commit(); conn.close()
 
-    # ── Read-only DB helpers ───────────────────────────────────────────────────
-    # NOTE: This tab does NOT call the Sigenergy API directly. live_logger.py
-    # runs on the Pi via cron every 5 minutes (matching the documented API
-    # rate limit of "one access per station/device every 5 minutes" which
-    # applies identically to /energyFlow, /summary, and /devices/.../realtimeInfo).
-    # This tab only ever reads from live_readings.db (or its CSV export as a
-    # fallback), so the dashboard can be auto-refreshed as often as you like
-    # (e.g. every 30s during a demo) without ever risking error 1201.
+    def save_reading(ts, data: dict):
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            INSERT OR REPLACE INTO live_readings VALUES
+            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            ts,
+            data.get("pv_kw", 0),       data.get("grid_kw", 0),
+            data.get("load_kw", 0),      data.get("battery_kw", 0),
+            data.get("battery_soc", 0),  data.get("cloud_cover", 0),
+            data.get("irradiance", 0),   data.get("temperature", 0),
+            data.get("pv_daily_kwh", 0), data.get("pv_month_kwh", 0),
+            data.get("pv_year_kwh", 0),  data.get("pv_life_kwh", 0),
+            data.get("inv_temp", 0),     data.get("inv_pv_kw", 0),
+            data.get("bat_dischd", 0),   data.get("co2_saved", 0),
+            data.get("coal_saved", 0),   data.get("trees", 0),
+        ))
+        conn.commit(); conn.close()
 
-    def load_latest() -> tuple[dict, str]:
-        """Return (reading_dict, source) where source is 'db', 'csv', or 'none'.
-        Tries live_readings.db first (true real-time, available on the Pi);
-        falls back to live_latest.csv (up to ~1hr old, available wherever
-        GitHub synced it, e.g. Streamlit Cloud) if the DB doesn't exist.
-        The source matters because the two have very different freshness
-        cadences - 5 minutes for the DB, up to an hour for the CSV - so the
-        "is this stale" check downstream needs to use a different threshold
-        depending on which one we actually read from."""
-        if os.path.exists(DB_PATH):
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                row = conn.execute(
-                    "SELECT * FROM live_readings ORDER BY ts DESC LIMIT 1"
-                ).fetchone()
-                cols = [d[0] for d in conn.execute("SELECT * FROM live_readings LIMIT 0").description] if row else []
-                conn.close()
-                if row:
-                    return dict(zip(cols, row)), "db"
-            except Exception:
-                pass
-
-        # Fallback: CSV export (Streamlit Cloud scenario)
-        if os.path.exists(LATEST_CSV_PATH):
-            try:
-                df = pd.read_csv(LATEST_CSV_PATH)
-                if len(df) > 0:
-                    return df.iloc[0].to_dict(), "csv"
-            except Exception:
-                pass
-
-        return {}, "none"
+    def load_latest() -> dict:
+        """Return the most recent reading from DB as a dict."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            row = conn.execute(
+                "SELECT * FROM live_readings ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row:
+                cols = ["ts","pv_kw","grid_kw","load_kw","battery_kw",
+                        "battery_soc","cloud_cover","irradiance","temperature",
+                        "pv_daily_kwh","pv_month_kwh","pv_year_kwh","pv_life_kwh",
+                        "inv_temp","inv_pv_kw","bat_dischd","co2_saved",
+                        "coal_saved","trees"]
+                return dict(zip(cols, row))
+        except Exception:
+            pass
+        return {}
 
     def load_history(days=7) -> pd.DataFrame:
-        """Return readings from the last `days` days, oldest first. Same
-        DB-first, CSV-fallback pattern as load_latest()."""
-        if os.path.exists(DB_PATH):
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
-                df = pd.read_sql(
-                    "SELECT * FROM live_readings WHERE ts >= ? ORDER BY ts",
-                    conn, params=(cutoff,)
-                )
-                conn.close()
-                return df
-            except Exception:
-                pass
-
-        # Fallback: CSV export (Streamlit Cloud scenario). Already filtered
-        # to 7 days by export_live_csv.py, but re-filter here in case `days`
-        # differs from that script's default.
-        if os.path.exists(HISTORY_CSV_PATH):
-            try:
-                df = pd.read_csv(HISTORY_CSV_PATH)
-                if "ts" in df.columns and len(df) > 0:
-                    cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
-                    df = df[df["ts"] >= cutoff].sort_values("ts")
-                return df
-            except Exception:
-                pass
-
-        return pd.DataFrame()
-
-    # ── Load latest reading from DB (or CSV fallback) ──────────────────────────
-    d, data_source = load_latest()
-
-    data_fresh = False
-    reading_age_seconds = None
-    if d and d.get("ts"):
         try:
-            reading_ts = pd.Timestamp(d["ts"])
-            if reading_ts.tzinfo is None:
-                reading_ts = reading_ts.tz_localize("UTC")
-            reading_age_seconds = (pd.Timestamp.now(tz="UTC") - reading_ts).total_seconds()
-            # Freshness threshold depends on the data source:
-            # - DB: live_logger.py runs every 5 min, so 10 min allows one
-            #   missed cycle plus slack before flagging as stale.
-            # - CSV: hourly_export_push.sh runs once per hour, so a much
-            #   longer threshold is needed - otherwise the CSV fallback would
-            #   ALWAYS show as stale, defeating the point of having it. 90
-            #   min allows one full hourly cycle plus slack.
-            freshness_threshold = 600 if data_source == "db" else 5400
-            data_fresh = reading_age_seconds < freshness_threshold
+            conn = sqlite3.connect(DB_PATH)
+            cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
+            df = pd.read_sql(
+                "SELECT * FROM live_readings WHERE ts >= ? ORDER BY ts",
+                conn, params=(cutoff,)
+            )
+            conn.close()
+            return df
         except Exception:
-            data_fresh = False
+            return pd.DataFrame()
 
-    # Reconstruct nested structures the rest of this tab expects, from the
-    # flat columns live_logger.py writes.
-    live_data = None
-    if d:
-        live_data = {
-            "pv_strings": {
-                f"{inv}-{s}": {"v": d.get(f"inv{inv}_pv{s}_v", 0), "a": d.get(f"inv{inv}_pv{s}_a", 0)}
-                for inv in range(1, 4) for s in range(1, 5)
-            },
-            "phases": {ph: {"v": d.get(f"phase_{ph}_v", 0), "a": d.get(f"phase_{ph}_a", 0)} for ph in ["a", "b", "c"]},
-            "power_factor": d.get("power_factor", 0),
-            "grid_freq": d.get("grid_freq", 0),
-            "inv_temps": [d.get(f"inv{i}_temp", 0) for i in range(1, 4)],
-        }
+    init_db()
 
-    weather = {
-        "temperature":   d.get("temperature", 0),
-        "cloud_cover":   d.get("cloud_cover", 0),
-        "wind_speed":    d.get("wind_speed", 0),
-        "precipitation": d.get("precipitation", 0),
-        "irradiance":    d.get("irradiance", 0),
-    } if d else {}
+    # ── API helpers ───────────────────────────────────────────────────────────
+    @st.cache_data(ttl=280)
+    def get_live_token():
+        r = _requests.post(
+            f"{LIVE_API_BASE}/openapi/auth/login/password",
+            json={"username": LIVE_USERNAME, "password": LIVE_PASSWORD}, timeout=10
+        )
+        body = r.json()
+        if body.get("code") != 0: return None
+        d = body["data"]
+        if isinstance(d, str): d = _json_live.loads(d)
+        return d["accessToken"]
+
+    def _api_get(token, path):
+        r = _requests.get(f"{LIVE_API_BASE}{path}",
+                          headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        body = r.json()
+        if body.get("code") != 0: return None
+        d = body.get("data", {})
+        return _json_live.loads(d) if isinstance(d, str) else d
+
+    def fetch_all_live():
+        """Fetch all live data and return a unified dict. Returns None on failure."""
+        try:
+            token = get_live_token()
+            if not token: return None
+
+            flow    = _api_get(token, f"/openapi/systems/{LIVE_SYSTEM_ID}/energyFlow")
+            summary = _api_get(token, f"/openapi/systems/{LIVE_SYSTEM_ID}/summary")
+            dev_raw = _api_get(token, f"/openapi/systems/{LIVE_SYSTEM_ID}/devices/{LIVE_INVERTER_SN}/realtimeInfo")
+            dev = dev_raw.get("realTimeInfo", dev_raw) if dev_raw else {}
+
+            if not flow: return None
+
+            pv_kw   = float(flow.get("pvPower", 0) or 0)
+            grid_kw = float(flow.get("gridPower", 0) or 0)
+            load_kw = float(flow.get("loadPower", 0) or 0)
+            batt_kw = float(flow.get("batteryPower", 0) or 0)
+            batt_soc= float(flow.get("batterySoc", 0) or 0)
+
+            return {
+                "pv_kw":        pv_kw,
+                "grid_kw":      grid_kw,
+                "load_kw":      load_kw,
+                "battery_kw":   batt_kw,
+                "battery_soc":  batt_soc,
+                "pv_daily_kwh": float(summary.get("dailyPowerGeneration", 0) or 0) if summary else 0,
+                "pv_month_kwh": float(summary.get("monthlyPowerGeneration", 0) or 0) if summary else 0,
+                "pv_year_kwh":  float(summary.get("annualPowerGeneration", 0) or 0) if summary else 0,
+                "pv_life_kwh":  float(summary.get("lifetimePowerGeneration", 0) or 0) if summary else 0,
+                "co2_saved":    float(summary.get("lifetimeCo2", 0) or 0) if summary else 0,
+                "coal_saved":   float(summary.get("lifetimeCoal", 0) or 0) if summary else 0,
+                "trees":        float(summary.get("lifetimeTreeEquivalent", 0) or 0) if summary else 0,
+                "inv_temp":     float(dev.get("internalTemperature", 0) or 0),
+                "inv_pv_kw":    float(dev.get("pvTotalPower", 0) or 0),
+                "bat_dischd":   float(dev.get("esDischargingDay", 0) or 0),
+                "pv_strings":   {i: {
+                    "v": float(dev.get(f"pv{i}Voltage", 0) or 0),
+                    "a": float(dev.get(f"pv{i}Current", 0) or 0),
+                } for i in range(1, 5)},
+                "phases": {ph: {
+                    "v": float(dev.get(f"{ph}PhaseVoltage", 0) or 0),
+                    "a": float(dev.get(f"{ph}PhaseCurrent", 0) or 0),
+                } for ph in ["a","b","c"]},
+                "power_factor": float(dev.get("powerFactor", 0) or 0),
+                "grid_freq":    float(dev.get("gridFrequency", 0) or 0),
+            }
+        except Exception:
+            return None
+
+    def fetch_weather():
+        try:
+            r = _requests.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": LAT, "longitude": LON,
+                "current":  "temperature_2m,cloud_cover,wind_speed_10m,precipitation",
+                "hourly":   "shortwave_radiation,cloud_cover,temperature_2m",
+                "forecast_days": 1, "timezone": "Africa/Johannesburg",
+            }, timeout=10)
+            d = r.json()
+            curr = d.get("current", {})
+            now_hour = _dt.now().strftime("%Y-%m-%dT%H:00")
+            times = d.get("hourly", {}).get("time", [])
+            irr = d["hourly"]["shortwave_radiation"][times.index(now_hour)] if now_hour in times else 0
+            return {
+                "temperature": curr.get("temperature_2m", 0),
+                "cloud_cover": curr.get("cloud_cover", 0),
+                "wind_speed":  curr.get("wind_speed_10m", 0),
+                "precipitation": curr.get("precipitation", 0),
+                "irradiance":  irr or 0,
+            }
+        except Exception:
+            return {}
+
+    # ── Fetch data — fallback to cached if API fails ──────────────────────────
+    live_data = fetch_all_live()
+    weather   = fetch_weather()
+    data_fresh = live_data is not None
+
+    if live_data:
+        ts = _dt.now(_tz.utc).isoformat()
+        live_data.update({
+            "cloud_cover": weather.get("cloud_cover", 0),
+            "irradiance":  weather.get("irradiance", 0),
+            "temperature": weather.get("temperature", 0),
+        })
+        save_reading(ts, live_data)
+        d = live_data
+    else:
+        d = load_latest()
 
     # ── Header ────────────────────────────────────────────────────────────────
     hdr_left, hdr_right = st.columns([3, 1])
     with hdr_left:
         st.subheader("Live System Dashboard — The Millennial")
-        _source_label = "updates every 5 min" if data_source == "db" else "synced hourly from Pi via GitHub"
         if data_fresh:
-            reading_ts_local = pd.Timestamp(d["ts"])
-            if reading_ts_local.tzinfo is None:
-                reading_ts_local = reading_ts_local.tz_localize("UTC")
-            reading_ts_local = reading_ts_local.tz_convert("Africa/Johannesburg")
-            st.caption(f"Last reading: {reading_ts_local.strftime('%d %b %Y %H:%M:%S')} SAST "
-                       f"({_source_label})")
+            st.caption(f"Live data as of {_dt.now(_tz(_td(hours=2))).strftime('%d %b %Y %H:%M:%S')} SAST")
         elif d:
-            reading_ts_local = pd.Timestamp(d["ts"])
-            if reading_ts_local.tzinfo is None:
-                reading_ts_local = reading_ts_local.tz_localize("UTC")
-            reading_ts_local = reading_ts_local.tz_convert("Africa/Johannesburg")
-            age_min = int(reading_age_seconds // 60) if reading_age_seconds else 0
-            st.caption(f"Last reading: {reading_ts_local.strftime('%d %b %Y %H:%M:%S')} SAST "
-                       f"({age_min} min ago)")
-            if data_source == "db":
-                st.warning(
-                    "The background logger (live_logger.py) hasn't reported in over "
-                    "10 minutes — check the Pi's cron job and live_logger.log."
-                )
-            else:
-                st.warning(
-                    "The hourly GitHub sync (hourly_export_push.sh on the Pi) hasn't "
-                    "updated in over 90 minutes — check that script's cron job and log "
-                    "on the Pi."
-                )
+            cached_ts = pd.Timestamp(d.get("ts","")).tz_convert("Africa/Johannesburg")
+            st.caption(f"API unavailable — showing last known data from {cached_ts.strftime('%d %b %Y %H:%M')} SAST")
+            st.warning("Live API unreachable — displaying cached data.")
         else:
-            st.info(
-                "No live data yet. Make sure live_logger.py is running on the Pi "
-                "(cron job every 5 minutes) to populate live_readings.db, and that "
-                "hourly_export_push.sh is syncing it to GitHub if you're viewing this "
-                "on Streamlit Cloud."
-            )
+            st.info("No data available yet. Refresh to try again.")
     with hdr_right:
         auto_refresh = st.toggle("Auto-refresh 30s", value=False)
         if st.button("Refresh now"):
@@ -2329,10 +2303,7 @@ with tab6:
     grid_export  = max(0,  grid_kw)
     batt_charge  = max(0,  batt_kw)
     batt_disc    = max(0, -batt_kw)
-    # Average across the 3 inverters for the summary card; individual
-    # per-inverter temps are shown in the Inverter & Grid Details expander.
-    _inv_temps_raw = [d.get(f"inv{i}_temp", 0) for i in range(1, 4)]
-    inv_temp     = sum(_inv_temps_raw) / len(_inv_temps_raw) if _inv_temps_raw else 0
+    inv_temp     = d.get("inv_temp", 0)
     cloud        = d.get("cloud_cover", 0)
     irradiance   = d.get("irradiance", 0)
     temperature  = d.get("temperature", 0)
@@ -2387,10 +2358,9 @@ with tab6:
                 f"SoC: {batt_soc:.0f}%", "#888888"), unsafe_allow_html=True)
     with c5:
         soc_color = "#E24B4A" if batt_soc < 20 else "#EF9F27" if batt_soc < 50 else "#1D9E75"
-        _inv_temp_label = f"{inv_temp:.1f}degC" if inv_temp > 0 else "N/A"
         st.markdown(power_card(
             "Battery SoC", f"{batt_soc:.0f}", "%",
-            f"Inverter: {_inv_temp_label}", soc_color), unsafe_allow_html=True)
+            f"Inverter: {inv_temp:.1f}degC", soc_color), unsafe_allow_html=True)
 
     # ── SECTION 1B — Animated Sankey Energy Flow ──────────────────────────────
     st.markdown("---")
@@ -2401,17 +2371,9 @@ with tab6:
     solar_to_batt    = min(pv_kw - solar_to_load, batt_charge) if batt_charge > 0 else 0
     solar_to_grid    = max(0, pv_kw - solar_to_load - solar_to_batt)
     grid_to_load     = max(0, grid_import - 0)
-    grid_to_batt     = max(0, batt_charge - solar_to_batt)
     batt_to_load     = max(0, batt_disc)
 
-    # 3-column layout matching the Sigenergy portal's own energy flow diagram:
-    #   Left column   (sources):      Solar, Grid
-    #   Middle column  (always Battery, whether charging or discharging):
-    #   Right column  (destinations): Load, Grid Export
-    # Battery sits in a TRUE middle column regardless of charge/discharge
-    # state - it always both receives (from Solar/Grid when charging) and
-    # sends (to Load when discharging) so it never collapses into a thin
-    # pass-through or gets pinned to an edge it doesn't belong on.
+    # Only include flows > 0.05 kW to keep diagram clean
     sankey_labels = ["Solar", "Grid", "Battery", "Load", "Grid Export"]
     sankey_source = []
     sankey_target = []
@@ -2419,12 +2381,11 @@ with tab6:
     sankey_colors = []
 
     flow_map = [
-        (0, 3, solar_to_load,  "rgba(239,159,39,0.6)"),   # Solar -> Load (direct, bypasses battery)
-        (0, 2, solar_to_batt,  "rgba(239,159,39,0.4)"),   # Solar -> Battery (charging)
-        (0, 4, solar_to_grid,  "rgba(239,159,39,0.5)"),   # Solar -> Grid Export
-        (1, 3, grid_to_load,   "rgba(127,119,221,0.6)"),  # Grid -> Load (direct, bypasses battery)
-        (1, 2, grid_to_batt,   "rgba(127,119,221,0.4)"),  # Grid -> Battery (charging from grid)
-        (2, 3, batt_to_load,   "rgba(29,158,117,0.6)"),   # Battery -> Load (discharging)
+        (0, 3, solar_to_load,  "rgba(239,159,39,0.6)"),   # Solar -> Load
+        (0, 2, solar_to_batt,  "rgba(239,159,39,0.4)"),   # Solar -> Battery
+        (0, 4, solar_to_grid,  "rgba(29,158,117,0.5)"),   # Solar -> Grid Export
+        (1, 3, grid_to_load,   "rgba(127,119,221,0.6)"),  # Grid -> Load
+        (2, 3, batt_to_load,   "rgba(29,158,117,0.6)"),   # Battery -> Load
     ]
     for src, tgt, val, col in flow_map:
         if val > 0.05:
@@ -2441,11 +2402,8 @@ with tab6:
                 line=dict(color="rgba(255,255,255,0.1)", width=0.5),
                 label=sankey_labels,
                 color=["#EF9F27","#7F77DD","#1D9E75","#E24B4A","#3B8BD4"],
-                # True 3-column layout: x=0 (sources), x=0.5 (battery, always
-                # middle), x=1.0 (destinations) - matches the Sigenergy
-                # portal's own Energy Statistics diagram structure.
                 x=[0.0, 0.0, 0.5, 1.0, 1.0],
-                y=[0.1, 0.7, 0.4, 0.3, 0.7],
+                y=[0.1, 0.7, 0.4, 0.4, 0.1],
             ),
             link=dict(
                 source=sankey_source,
@@ -2542,8 +2500,8 @@ with tab6:
     # Current TOU slot
     now_sa = _dt.now(_tz(_td(hours=2)))
     _tou_now = get_tou_slot(now_sa) if 'get_tou_slot' in dir() else "1.8.2"
-    _season_now = get_season(now_sa)
-    _tariff_now = get_tariff_for_date(now_sa, _tou_now)
+    _season_now = "high" if now_sa.month in [6,7,8] else "low"
+    _tariff_now = TARIFF[_season_now][_tou_now]
     _tou_name = {"1.8.1":"PEAK","1.8.2":"Standard","1.8.3":"Off-Peak"}[_tou_now]
     _tou_color = {"1.8.1":"#E24B4A","1.8.2":"#EF9F27","1.8.3":"#1D9E75"}[_tou_now]
 
@@ -2636,44 +2594,17 @@ with tab6:
     st.markdown("---")
     st.markdown("**PV String Health Monitor**")
 
-    # Detect inverters where the ENTIRE device fetch likely failed (all 4
-    # strings AND pv_kw are exactly 0) vs. genuinely idle/disconnected
-    # strings on an inverter that otherwise reported real data. A failed
-    # fetch defaults every field to 0 via .get(..., 0), which is a different
-    # situation from a string that's truly producing nothing.
-    _missing_inverters = []
-    for inv in range(1, 4):
-        _inv_pv_kw = d.get(f"inv{inv}_pv_kw", 0)
-        _inv_strings_all_zero = all(
-            d.get(f"inv{inv}_pv{s}_v", 0) == 0 and d.get(f"inv{inv}_pv{s}_a", 0) == 0
-            for s in range(1, 5)
-        )
-        if _inv_pv_kw == 0 and _inv_strings_all_zero:
-            _missing_inverters.append(inv)
-
-    if _missing_inverters:
-        _names = ", ".join(f"Inverter {i}" for i in _missing_inverters)
-        st.warning(
-            f"{_names} reported no data on the last logger run (likely a "
-            f"transient API timeout/error - live_logger.py retries automatically, "
-            f"so this should resolve on the next 5-minute cycle). Strings for "
-            f"{'this inverter' if len(_missing_inverters)==1 else 'these inverters'} "
-            f"are hidden below rather than shown as disconnected."
-        )
-
     if live_data and live_data.get("pv_strings"):
         strings = {i: v for i, v in live_data["pv_strings"].items()
-                   if (abs(v["v"]) > 0.1 or abs(v["a"]) > 0.01)
-                   and int(i.split("-")[0]) not in _missing_inverters}
+                   if abs(v["v"]) > 0.1 or abs(v["a"]) > 0.01}
         if strings:
             str_rows = []
             powers = []
             for i, sv in strings.items():
                 p = round(sv["v"] * sv["a"] / 1000, 3)
                 powers.append(p)
-                inv_num, string_num = i.split("-")
                 str_rows.append({
-                    "String": f"Inv{inv_num} PV{string_num}",
+                    "String": f"PV {i}",
                     "Voltage (V)": round(sv["v"], 2),
                     "Current (A)": round(sv["a"], 3),
                     "Power (kW)":  p,
@@ -2814,33 +2745,15 @@ with tab6:
     # ── SECTION 8 — Inverter Details (collapsed) ──────────────────────────────
     st.markdown("---")
     with st.expander("Inverter & Grid Details", expanded=False):
-        _total_inv_pv_kw = sum(d.get(f"inv{i}_pv_kw", 0) for i in range(1, 4))
         inv1, inv2, inv3, inv4 = st.columns(4)
-        inv1.metric("Total PV Power (3 inverters)", f"{_total_inv_pv_kw:.2f} kW")
-        inv2.metric("Avg Inverter Temp",
-                    f"{inv_temp:.1f} degC" if inv_temp > 0 else "N/A",
-                    delta=("High" if inv_temp > 60 else "Normal") if inv_temp > 0 else None,
-                    delta_color="inverse" if inv_temp > 60 else "off")
+        inv1.metric("PV Power",       f"{d.get('inv_pv_kw',0):.2f} kW")
+        inv2.metric("Inverter Temp",  f"{d.get('inv_temp',0):.1f} degC",
+                    delta="High" if d.get('inv_temp',0) > 60 else "Normal",
+                    delta_color="inverse" if d.get('inv_temp',0) > 60 else "off")
         inv3.metric("Power Factor",   f"{live_data.get('power_factor',0):.3f}" if live_data else "—")
         inv4.metric("Grid Frequency", f"{live_data.get('grid_freq',0):.2f} Hz" if live_data else "—",
                     delta="OK" if live_data and 49.5 <= live_data.get('grid_freq',50) <= 50.5 else "Out of range",
                     delta_color="off" if live_data and 49.5 <= live_data.get('grid_freq',50) <= 50.5 else "inverse")
-
-        st.markdown("**Per-Inverter Temperature & PV Output**")
-        st.caption(
-            "Note: internal temperature isn't reported by this inverter model/firmware "
-            "(also absent from the Sigenergy portal's own Real Time Info panel) - "
-            "shown as '—' when unavailable rather than a misleading 0 degC."
-        )
-        inv_rows = [{
-            "Inverter": f"Inverter {i}",
-            "Temp (degC)": (f"{d.get(f'inv{i}_temp', 0):.1f}" if d.get(f"inv{i}_temp", 0) > 0 else "—"),
-            "PV Power (kW)": round(d.get(f"inv{i}_pv_kw", 0), 2),
-            "Status": ("High" if d.get(f"inv{i}_temp", 0) > 60
-                        else "Normal" if d.get(f"inv{i}_temp", 0) > 0
-                        else "—"),
-        } for i in range(1, 4)]
-        st.dataframe(pd.DataFrame(inv_rows), use_container_width=True, hide_index=True)
 
         if live_data and live_data.get("phases"):
             st.markdown("**Grid Phases**")
@@ -2851,358 +2764,468 @@ with tab6:
                        for ph in ["a","b","c"]]
             st.dataframe(pd.DataFrame(ph_rows), use_container_width=True, hide_index=True)
 
-    # ── SECTION 9 — 7-day trends & PV string diagnostics ──────────────────────
+    # ── SECTION 9 — 7-day trends ──────────────────────────────────────────────
     st.markdown("---")
-    st.header("📈 Trends & Panel Diagnostics — Last 7 Days")
+    st.markdown("**Last 7 Days — Power & Weather Trends**")
 
     hist = load_history(days=7)
     if not hist.empty:
         hist["ts"] = pd.to_datetime(hist["ts"]).dt.tz_convert("Africa/Johannesburg")
-        hist = hist.sort_values("ts").reset_index(drop=True)
 
-        # ── 9A. Power Flow — its own full-width chart, one y-axis (kW) ────────
-        st.subheader("⚡ Power Flow")
-        fig_power = go.Figure()
-        fig_power.add_scatter(
-            x=hist["ts"], y=hist["pv_kw"], name="Solar",
-            line=dict(color="#EF9F27", width=2),
-            fill="tozeroy", fillcolor="rgba(239,159,39,0.12)",
+        # Combined power + cloud cover chart
+        fig_hist = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.65, 0.35],
+            subplot_titles=("Power Flow (kW)", "Cloud Cover (%) & Irradiance (W/m2)"),
+            vertical_spacing=0.08,
         )
-        fig_power.add_scatter(
-            x=hist["ts"], y=hist["load_kw"], name="Load",
-            line=dict(color="#E24B4A", width=2, dash="dot"),
+        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["pv_kw"],
+            name="Solar kW", line=dict(color="#EF9F27", width=2),
+            fill="tozeroy", fillcolor="rgba(239,159,39,0.15)"), row=1, col=1)
+        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["load_kw"],
+            name="Load kW", line=dict(color="#E24B4A", width=1.5, dash="dot")), row=1, col=1)
+        fig_hist.add_trace(go.Scatter(x=hist["ts"],
+            y=hist["grid_kw"].apply(lambda v: max(0,-v)),
+            name="Grid Import kW", line=dict(color="#7F77DD", width=1)), row=1, col=1)
+        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["battery_soc"],
+            name="Battery SoC %", line=dict(color="#1D9E75", width=1.5, dash="dash")), row=1, col=1)
+        fig_hist.add_trace(go.Bar(x=hist["ts"], y=hist["cloud_cover"],
+            name="Cloud Cover %", marker_color="rgba(127,119,221,0.4)"), row=2, col=1)
+        fig_hist.add_trace(go.Scatter(x=hist["ts"], y=hist["irradiance"],
+            name="Irradiance W/m2", line=dict(color="#EF9F27", width=1.5)), row=2, col=1)
+        fig_hist.update_layout(
+            height=480, legend_title="Metric",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
         )
-        fig_power.add_scatter(
-            x=hist["ts"], y=hist["grid_kw"].apply(lambda v: max(0, -v)),
-            name="Grid import", line=dict(color="#7F77DD", width=2),
-        )
-        fig_power.update_layout(
-            height=360,
-            yaxis_title="kW",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=10, b=10, l=10, r=10),
-        )
-        fig_power.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_power.update_yaxes(gridcolor="rgba(255,255,255,0.06)", rangemode="tozero")
-        st.plotly_chart(fig_power, use_container_width=True)
+        fig_hist.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+        fig_hist.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+        st.plotly_chart(fig_hist, use_container_width=True)
 
-        # ── 9B. Battery SoC — separate chart, own 0-100% axis ──────────────────
-        st.subheader("🔋 Battery state of charge")
+        # Battery SoC trend with charge/discharge shading
         fig_bsoc = go.Figure()
-        fig_bsoc.add_scatter(
-            x=hist["ts"], y=hist["battery_soc"], name="Battery SoC",
-            fill="tozeroy", line=dict(color="#1D9E75", width=2),
-            fillcolor="rgba(29,158,117,0.12)",
-        )
-        fig_bsoc.add_hline(
-            y=20, line_dash="dash", line_color="#E24B4A",
-            annotation_text="Low SoC threshold (20%)", annotation_font_color="#E24B4A",
-        )
+        fig_bsoc.add_scatter(x=hist["ts"], y=hist["battery_soc"],
+            name="Battery SoC", fill="tozeroy",
+            line=dict(color="#1D9E75", width=2),
+            fillcolor="rgba(29,158,117,0.15)")
+        fig_bsoc.add_hline(y=20, line_dash="dash", line_color="#E24B4A",
+                           annotation_text="Low SoC threshold (20%)")
         fig_bsoc.update_layout(
-            height=260, yaxis=dict(title="SoC (%)", range=[0, 105]),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
+            title="Battery State of Charge — Last 7 Days",
+            xaxis_title="", yaxis=dict(title="SoC (%)", range=[0,105]),
+            height=260, paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
         )
-        fig_bsoc.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_bsoc.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_bsoc.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+        fig_bsoc.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
         st.plotly_chart(fig_bsoc, use_container_width=True)
 
-        # ── 9C. Weather + Solar Production — stacked, synced x-axis ───────────
-        # Three genuinely different units (kW, W/m², %) so each gets its own
-        # y-axis - but stacking them with a SHARED x-axis (rather than side
-        # by side) lets you trace a vertical line straight down through all
-        # three and see exactly how a cloud cover dip lines up with an
-        # irradiance drop and the resulting dip in actual solar output.
-        st.subheader("🌤️ Weather vs. solar production")
-        st.caption(
-            "Stacked with a shared time axis so you can trace cause and effect "
-            "vertically: a cloud cover spike should line up with an irradiance "
-            "dip, which should line up with a dip in solar production. Each "
-            "panel keeps its own scale since the three are different units."
-        )
-
-        fig_weather_combo = make_subplots(
-            rows=3, cols=1, shared_xaxes=True,
-            row_heights=[0.34, 0.33, 0.33],
-            subplot_titles=("Solar production (kW)", "Irradiance (W/m²)", "Cloud cover (%)"),
-            vertical_spacing=0.06,
-        )
-        fig_weather_combo.add_trace(
-            go.Scatter(
-                x=hist["ts"], y=hist["pv_kw"], name="Solar production",
-                line=dict(color="#EF9F27", width=2),
-                fill="tozeroy", fillcolor="rgba(239,159,39,0.15)",
-            ), row=1, col=1
-        )
-        fig_weather_combo.add_trace(
-            go.Scatter(
-                x=hist["ts"], y=hist["irradiance"], name="Irradiance",
-                line=dict(color="#D85A30", width=2),
-                fill="tozeroy", fillcolor="rgba(216,90,48,0.15)",
-            ), row=2, col=1
-        )
-        fig_weather_combo.add_trace(
-            go.Scatter(
-                x=hist["ts"], y=hist["cloud_cover"], name="Cloud cover",
-                line=dict(color="#7F77DD", width=2),
-                fill="tozeroy", fillcolor="rgba(127,119,221,0.15)",
-            ), row=3, col=1
-        )
-        fig_weather_combo.update_layout(
-            height=620, showlegend=False,
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=30, b=10, l=10, r=10),
-        )
-        fig_weather_combo.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_weather_combo.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_weather_combo.update_yaxes(rangemode="tozero", row=1, col=1)
-        fig_weather_combo.update_yaxes(rangemode="tozero", row=2, col=1)
-        fig_weather_combo.update_yaxes(range=[0, 100], row=3, col=1)
-        st.plotly_chart(fig_weather_combo, use_container_width=True)
-
-        # ── 9D. Per-inverter PV power comparison ───────────────────────────────
-        st.subheader("☀️ Per-inverter solar output")
-        st.caption(
-            "Each inverter's own reported PV power output, plus the SITE TOTAL "
-            "(pv_kw from the live energy flow reading, measured independently "
-            "of the 3 inverters' own self-reports) and the sum of the 3 "
-            "inverters' outputs. If Sum of inverters tracks the Site total "
-            "closely, the inverters' own readings are trustworthy. A gap "
-            "between them points to a whole inverter dropping out or "
-            "misreporting — distinct from the per-string mismatch covered "
-            "below, which only catches faults INSIDE one inverter's own data."
-        )
-        fig_inv_compare = go.Figure()
-        inv_colors = {"inv1_pv_kw": "#EF9F27", "inv2_pv_kw": "#7F77DD", "inv3_pv_kw": "#1D9E75"}
-        inv_cols_present = [c for c in ["inv1_pv_kw", "inv2_pv_kw", "inv3_pv_kw"] if c in hist.columns]
-
-        for i, col in enumerate(["inv1_pv_kw", "inv2_pv_kw", "inv3_pv_kw"], start=1):
-            if col in hist.columns:
-                fig_inv_compare.add_scatter(
-                    x=hist["ts"], y=hist[col], name=f"Inverter {i}",
-                    line=dict(color=inv_colors[col], width=2),
-                )
-
-        if inv_cols_present:
-            inv_sum = hist[inv_cols_present].sum(axis=1)
-            fig_inv_compare.add_scatter(
-                x=hist["ts"], y=inv_sum, name="Sum of inverters",
-                line=dict(color="#D85A30", width=2, dash="dot"),
-            )
-
-        if "pv_kw" in hist.columns:
-            fig_inv_compare.add_scatter(
-                x=hist["ts"], y=hist["pv_kw"], name="Site total (independent reading)",
-                line=dict(color="#FFFFFF", width=2.5),
-            )
-
-        fig_inv_compare.update_layout(
-            height=340, yaxis=dict(title="kW", rangemode="tozero"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=10, b=10, l=10, r=10),
-        )
-        fig_inv_compare.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_inv_compare.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-        st.plotly_chart(fig_inv_compare, use_container_width=True)
-
-        # ── Quantify the sum-vs-total gap over the daylight window ────────────
-        if inv_cols_present and "pv_kw" in hist.columns:
-            daylight_compare = hist[hist["irradiance"] > 50] if "irradiance" in hist.columns else hist[hist["pv_kw"] > 0.5]
-            if len(daylight_compare) > 0:
-                avg_sum = daylight_compare[inv_cols_present].sum(axis=1).mean()
-                avg_total = daylight_compare["pv_kw"].mean()
-                if avg_total > 0.05:
-                    site_gap_pct = 100 * (avg_total - avg_sum) / avg_total
-                else:
-                    site_gap_pct = 0.0
-
-                gap_col1, gap_col2, gap_col3 = st.columns(3)
-                gap_col1.metric("Avg sum of inverters", f"{avg_sum:.2f} kW")
-                gap_col2.metric("Avg site total", f"{avg_total:.2f} kW")
-                gap_col3.metric(
-                    "Gap (site total vs. sum)",
-                    f"{site_gap_pct:+.1f}%",
-                    delta_color="off",
-                )
-                if abs(site_gap_pct) > 10:
-                    st.warning(
-                        f"The 3 inverters' own readings sum to {site_gap_pct:+.1f}% "
-                        f"away from the independently-measured site total. This "
-                        f"suggests at least one inverter is under- or "
-                        f"over-reporting its own output, separate from any "
-                        f"single bad string inside it — check the per-inverter "
-                        f"diagnostics table below first to rule out a string-level "
-                        f"cause, then consider whether the energyFlow reading "
-                        f"itself or an inverter's communication link needs checking."
-                    )
-
-        # ── 9E. PV string fault detection ───────────────────────────────────────
-        st.subheader("🔍 PV string diagnostics — fault & mismatch detection")
-        st.caption(
-            "Compares the SUM of each inverter's 4 individual string readings "
-            "(voltage x current) against that inverter's OWN reported total PV "
-            "power. A meaningful gap between the two points to a specific "
-            "string with a problem - the per-string table below shows exactly "
-            "which one. A string reading near-zero voltage AND near-zero "
-            "current while its siblings are healthy usually means a "
-            "disconnected, faulty, or severely shaded/soiled panel string. "
-            "If the inverter's own total is ALSO near-zero, that's more "
-            "consistent with no strings being connected to that inverter at "
-            "all (or it being genuinely idle at night) rather than a fault."
-        )
-
-        # Restrict the fault analysis to meaningful daylight hours (irradiance
-        # above a low threshold) so we don't flag every inverter as "faulty"
-        # simply because it's night and everything reads near zero.
-        daylight = hist[hist["irradiance"] > 50] if "irradiance" in hist.columns else hist[hist["pv_kw"] > 0.5]
-
-        if len(daylight) > 0:
-            diag_rows = []
-            for inv in [1, 2, 3]:
-                pv_kw_col = f"inv{inv}_pv_kw"
-                if pv_kw_col not in daylight.columns:
-                    continue
-                string_sum_kw = sum(
-                    daylight[f"inv{inv}_pv{s}_v"] * daylight[f"inv{inv}_pv{s}_a"] / 1000
-                    for s in range(1, 5)
-                    if f"inv{inv}_pv{s}_v" in daylight.columns
-                )
-                reported_kw = daylight[pv_kw_col]
-                avg_string_sum = string_sum_kw.mean()
-                avg_reported = reported_kw.mean()
-                if avg_reported > 0.05:
-                    discrepancy_pct = 100 * (avg_reported - avg_string_sum) / avg_reported
-                else:
-                    discrepancy_pct = 0.0
-
-                if avg_reported < 0.1 and avg_string_sum < 0.1:
-                    status = "Idle / no strings connected"
-                elif abs(discrepancy_pct) > 15:
-                    status = "String data mismatch — check wiring/comms"
-                elif discrepancy_pct > 5:
-                    status = "Minor mismatch — monitor"
-                else:
-                    status = "OK"
-
-                diag_rows.append({
-                    "Inverter": f"Inverter {inv}",
-                    "Avg string-sum (kW)": round(avg_string_sum, 2),
-                    "Avg reported (kW)": round(avg_reported, 2),
-                    "Discrepancy": f"{discrepancy_pct:+.1f}%",
-                    "Status": status,
-                })
-
-            diag_df = pd.DataFrame(diag_rows)
-
-            def _status_color(val):
-                if "OK" in str(val):
-                    return "color: #1D9E75"
-                elif "Idle" in str(val):
-                    return "color: #888888"
-                elif "mismatch" in str(val).lower():
-                    return "color: #E24B4A"
-                return ""
-
-            st.dataframe(
-                diag_df.style.map(_status_color, subset=["Status"]),
-                use_container_width=True, hide_index=True,
-            )
-
-            # ── Per-string breakdown — pinpoint exactly which string is bad ───
-            st.markdown("**Per-string average power (daylight hours only)**")
-            string_rows = []
-            for inv in [1, 2, 3]:
-                for s in range(1, 5):
-                    v_col, a_col = f"inv{inv}_pv{s}_v", f"inv{inv}_pv{s}_a"
-                    if v_col not in daylight.columns:
-                        continue
-                    p = daylight[v_col] * daylight[a_col] / 1000
-                    avg_p = p.mean()
-                    avg_v = daylight[v_col].mean()
-                    string_rows.append({
-                        "String": f"Inv{inv} PV{s}",
-                        "Avg voltage (V)": round(avg_v, 1),
-                        "Avg power (kW)": round(avg_p, 3),
-                    })
-            string_df = pd.DataFrame(string_rows)
-
-            if len(string_df) > 0:
-                # Flag strings producing well below their siblings' average
-                # within the SAME inverter (a fairer comparison than the
-                # site-wide average, since inverters can legitimately have
-                # different numbers of panels per string).
-                string_df["_inv"] = string_df["String"].str.extract(r"Inv(\d)")[0]
-                inv_avg = string_df.groupby("_inv")["Avg power (kW)"].transform("mean")
-                string_df["% of inverter avg"] = (
-                    100 * string_df["Avg power (kW)"] / inv_avg.replace(0, np.nan)
-                ).fillna(0).round(0)
-                string_df = string_df.drop(columns=["_inv"])
-
-                def _string_pct_color(val):
-                    try:
-                        v = float(val)
-                    except (TypeError, ValueError):
-                        return ""
-                    if v < 50:
-                        return "color: #E24B4A"
-                    elif v < 80:
-                        return "color: #EF9F27"
-                    return "color: #1D9E75"
-
-                fig_strings = go.Figure()
-                bar_colors = [
-                    "#E24B4A" if p < 50 else "#EF9F27" if p < 80 else "#1D9E75"
-                    for p in string_df["% of inverter avg"]
-                ]
-                fig_strings.add_bar(
-                    x=string_df["String"], y=string_df["Avg power (kW)"],
-                    marker_color=bar_colors,
-                    text=[f"{p:.0f}%" for p in string_df["% of inverter avg"]],
-                    textposition="outside",
-                )
-                fig_strings.update_layout(
-                    height=320,
-                    yaxis_title="Avg power (kW)",
-                    xaxis_title="",
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(t=10, b=10, l=10, r=10), showlegend=False,
-                )
-                fig_strings.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-                fig_strings.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-                st.plotly_chart(fig_strings, use_container_width=True)
-                st.caption(
-                    "Bar labels show each string's output as a % of its own "
-                    "inverter's average string output. Below 50% (red) strongly "
-                    "suggests a fault, disconnection, or heavy "
-                    "soiling/shading specific to that string."
-                )
-
-                st.dataframe(
-                    string_df.style.format({"% of inverter avg": "{:.0f}%"})
-                                    .map(_string_pct_color, subset=["% of inverter avg"]),
-                    use_container_width=True, hide_index=True,
-                )
-        else:
-            st.info(
-                "No daylight-hours data in the last 7 days to run string "
-                "diagnostics on yet."
-            )
-
     else:
-        st.info(
-            "No 7-day trend data yet — history builds up as live_logger.py "
-            "runs on the Pi every 5 minutes. Check back in a few hours."
-        )
+        st.info("No trend data yet — data builds up as this tab refreshes. Check back in a few minutes.")
 
     # ── Auto-refresh ──────────────────────────────────────────────────────────
     if auto_refresh:
-        import time as _time
         _time.sleep(30)
         st.cache_data.clear()
         st.rerun()
 
+
+# ── Raw data (optional) ───────────────────────────────────────────────────────
+if show_raw:
+    st.divider()
+    st.subheader("Raw Hourly Data")
+    st.dataframe(hourly, use_container_width=True)
+
+    # ── Config ────────────────────────────────────────────────────────────────
+    # Load credentials from st.secrets (Streamlit Cloud) or os.getenv (local .env)
+    def _get_secret(key, default=None):
+        try:
+            return st.secrets[key]
+        except Exception:
+            return os.getenv(key, default)
+
+    LIVE_API_BASE    = _get_secret("SIGEN_API_BASE", "https://openapi-eu.sigencloud.com")
+    LIVE_SYSTEM_ID   = _get_secret("SIGEN_SYSTEM_ID", "HUCUD1764140703")
+    LIVE_USERNAME    = _get_secret("SIGEN_USERNAME")
+    LIVE_PASSWORD    = _get_secret("SIGEN_PASSWORD")
+    LIVE_INVERTER_SN = _get_secret("SIGEN_INVERTER_SN", "110B1K500388")
+
+    # Umhlanga coordinates for weather
+    LAT, LON = -29.7215, 31.0498
+    SA_TZ_OFFSET = _td(hours=2)
+
+    # SQLite DB path — stores live readings for trend charts
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_readings.db")
+
+    # ── SQLite setup ──────────────────────────────────────────────────────────
+    def init_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS live_readings (
+                ts          TEXT PRIMARY KEY,
+                pv_kw       REAL,
+                grid_kw     REAL,
+                load_kw     REAL,
+                battery_kw  REAL,
+                battery_soc REAL,
+                cloud_cover REAL,
+                irradiance  REAL,
+                temperature REAL
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def save_reading(ts, pv, grid, load, batt, soc, cloud, irr, temp):
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            INSERT OR REPLACE INTO live_readings
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (ts, pv, grid, load, batt, soc, cloud, irr, temp))
+        conn.commit()
+        conn.close()
+
+    def load_history(days=7):
+        conn = sqlite3.connect(DB_PATH)
+        cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
+        df = pd.read_sql(
+            "SELECT * FROM live_readings WHERE ts >= ? ORDER BY ts",
+            conn, params=(cutoff,)
+        )
+        conn.close()
+        return df
+
+    init_db()
+
+    # ── API helpers ───────────────────────────────────────────────────────────
+    @st.cache_data(ttl=300)  # cache token for 5 minutes
+    def get_live_token():
+        r = _requests.post(
+            f"{LIVE_API_BASE}/openapi/auth/login/password",
+            json={"username": LIVE_USERNAME, "password": LIVE_PASSWORD},
+            timeout=10
+        )
+        body = r.json()
+        if body.get("code") != 0:
+            return None
+        data = _json_live.loads(body["data"]) if isinstance(body["data"], str) else body["data"]
+        return data["accessToken"]
+
+    def fetch_energy_flow(token):
+        """GET /openapi/systems/{systemId}/energyFlow — live power flow."""
+        headers = {"Authorization": f"Bearer {token}"}
+        r = _requests.get(
+            f"{LIVE_API_BASE}/openapi/systems/{LIVE_SYSTEM_ID}/energyFlow",
+            headers=headers, timeout=10
+        )
+        body = r.json()
+        if body.get("code") != 0:
+            return None
+        data = body.get("data", {})
+        if isinstance(data, str):
+            data = _json_live.loads(data)
+        return data
+
+    def fetch_system_summary(token):
+        """GET /openapi/systems/{systemId}/summary — daily/monthly totals."""
+        headers = {"Authorization": f"Bearer {token}"}
+        r = _requests.get(
+            f"{LIVE_API_BASE}/openapi/systems/{LIVE_SYSTEM_ID}/summary",
+            headers=headers, timeout=10
+        )
+        body = r.json()
+        if body.get("code") != 0:
+            return None
+        data = body.get("data", {})
+        if isinstance(data, str):
+            data = _json_live.loads(data)
+        return data
+
+    def fetch_device_realtime(token, serial_number):
+        """GET /openapi/systems/{systemId}/devices/{serialNumber}/realtimeInfo"""
+        headers = {"Authorization": f"Bearer {token}"}
+        r = _requests.get(
+            f"{LIVE_API_BASE}/openapi/systems/{LIVE_SYSTEM_ID}/devices/{serial_number}/realtimeInfo",
+            headers=headers, timeout=10
+        )
+        body = r.json()
+        if body.get("code") != 0:
+            return None
+        data = body.get("data", {})
+        if isinstance(data, str):
+            data = _json_live.loads(data)
+        return data.get("realTimeInfo", data)
+
+    def fetch_weather():
+        """Fetch current weather and irradiance from Open-Meteo (free, no key)."""
+        try:
+            r = _requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude":  LAT,
+                    "longitude": LON,
+                    "current":   "temperature_2m,cloud_cover,wind_speed_10m,precipitation",
+                    "hourly":    "shortwave_radiation,cloud_cover,temperature_2m",
+                    "forecast_days": 1,
+                    "timezone":  "Africa/Johannesburg",
+                },
+                timeout=10
+            )
+            d = r.json()
+            curr = d.get("current", {})
+            # Get current hour's irradiance
+            now_hour = _dt.now().strftime("%Y-%m-%dT%H:00")
+            hourly_times = d.get("hourly", {}).get("time", [])
+            irr = 0.0
+            if now_hour in hourly_times:
+                idx = hourly_times.index(now_hour)
+                irr = d["hourly"]["shortwave_radiation"][idx] or 0.0
+            return {
+                "temperature": curr.get("temperature_2m", 0),
+                "cloud_cover": curr.get("cloud_cover", 0),
+                "wind_speed":  curr.get("wind_speed_10m", 0),
+                "precipitation": curr.get("precipitation", 0),
+                "irradiance":  irr,
+            }
+        except Exception:
+            return {"temperature": 0, "cloud_cover": 0, "wind_speed": 0,
+                    "precipitation": 0, "irradiance": 0}
+
+    # ── Refresh controls ──────────────────────────────────────────────────────
+    col_refresh, col_auto = st.columns([1, 2])
+    with col_refresh:
+        manual_refresh = st.button("Refresh now")
+    with col_auto:
+        auto_refresh = st.toggle("Auto-refresh every 30s", value=True)
+
+    if auto_refresh:
+        st.caption("Auto-refreshing every 30 seconds...")
+
+    # ── Fetch live data ───────────────────────────────────────────────────────
+    live_error = None
+    flow = None
+    summary = None
+    device_rt = None
+    weather = {}
+
+    try:
+        token = get_live_token()
+        if token:
+            flow      = fetch_energy_flow(token)
+            summary   = fetch_system_summary(token)
+            device_rt = fetch_device_realtime(token, LIVE_INVERTER_SN)
+        else:
+            live_error = "Authentication failed — check SIGEN credentials in .env"
+    except Exception as e:
+        live_error = str(e)
+
+    weather = fetch_weather()
+
+    if live_error:
+        st.error(f"API error: {live_error}")
+    elif flow is None:
+        st.warning("No live data returned from API.")
+    else:
+        # Extract values
+        pv_kw   = float(flow.get("pvPower", 0) or 0)
+        grid_kw = float(flow.get("gridPower", 0) or 0)  # +ve = export, -ve = import
+        load_kw = float(flow.get("loadPower", 0) or 0)
+        batt_kw = float(flow.get("batteryPower", 0) or 0)  # +ve = charging, -ve = discharging
+        batt_soc= float(flow.get("batterySoc", 0) or 0)
+
+        grid_import_kw = max(0, -grid_kw)
+        grid_export_kw = max(0, grid_kw)
+        batt_charge_kw = max(0, batt_kw)
+        batt_disc_kw   = max(0, -batt_kw)
+
+        now_ts = _dt.now(_tz.utc).isoformat()
+        save_reading(now_ts, pv_kw, grid_kw, load_kw, batt_kw, batt_soc,
+                     weather.get("cloud_cover", 0),
+                     weather.get("irradiance", 0),
+                     weather.get("temperature", 0))
+
+        # ── SECTION 1 — Live KPIs ─────────────────────────────────────────────
+        st.subheader("Live Power Flow")
+        now_str = _dt.now(_tz(_td(hours=2))).strftime("%d %b %Y %H:%M:%S SAST")
+        st.caption(f"Last updated: {now_str}")
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Solar", f"{pv_kw:.1f} kW",
+                  help="Current PV generation")
+        k2.metric("Load", f"{load_kw:.1f} kW",
+                  help="Current site load")
+        k3.metric("Grid",
+                  f"{grid_import_kw:.1f} kW import" if grid_import_kw > 0 else f"{grid_export_kw:.1f} kW export",
+                  delta=f"{'Importing' if grid_import_kw > 0 else 'Exporting'}",
+                  delta_color="inverse" if grid_import_kw > 0 else "normal")
+        k4.metric("Battery",
+                  f"{batt_charge_kw:.1f} kW" if batt_charge_kw > 0 else f"{batt_disc_kw:.1f} kW",
+                  delta="Charging" if batt_charge_kw > 0 else "Discharging" if batt_disc_kw > 0 else "Idle")
+        k5.metric("Battery SoC", f"{batt_soc:.0f}%",
+                  help="Battery state of charge")
+
+        # Battery SoC gauge
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=batt_soc,
+            title={"text": "Battery State of Charge (%)"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar":  {"color": "#1D9E75"},
+                "steps": [
+                    {"range": [0, 20],  "color": "#E24B4A"},
+                    {"range": [20, 50], "color": "#EF9F27"},
+                    {"range": [50, 100],"color": "#1D9E75"},
+                ],
+                "threshold": {
+                    "line": {"color": "white", "width": 2},
+                    "thickness": 0.75,
+                    "value": batt_soc,
+                }
+            }
+        ))
+        fig_gauge.update_layout(height=280)
+        st.plotly_chart(fig_gauge, use_container_width=True)
+
+        # ── Inverter realtime details ──────────────────────────────────────────
+        if device_rt:
+            st.divider()
+            st.subheader("Inverter Details")
+            inv_c1, inv_c2, inv_c3, inv_c4, inv_c5, inv_c6 = st.columns(6)
+            inv_c1.metric("PV Power",       f"{float(device_rt.get('pvTotalPower', 0) or 0):.2f} kW")
+            inv_c2.metric("Inverter Temp",  f"{float(device_rt.get('internalTemperature', 0) or 0):.1f} degC")
+            inv_c3.metric("Battery Power",  f"{float(device_rt.get('batPower', 0) or 0):.2f} kW",
+                          help="Positive = discharging, Negative = charging")
+            inv_c4.metric("Daily PV",       f"{float(device_rt.get('pvEnergyDaily', 0) or 0):.2f} kWh")
+            inv_c5.metric("Lifetime PV",    f"{float(device_rt.get('pvEnergyTotal', 0) or 0):.1f} kWh")
+            inv_c6.metric("Batt Discharged Today", f"{float(device_rt.get('esDischargingDay', 0) or 0):.2f} kWh")
+
+            # PV Strings — show individual string voltages and currents
+            st.markdown("**PV String Details**")
+            strings_data = []
+            for i in range(1, 5):
+                v = float(device_rt.get(f"pv{i}Voltage", 0) or 0)
+                c = float(device_rt.get(f"pv{i}Current", 0) or 0)
+                p = round(v * c / 1000, 3)  # kW
+                if v != 0 or c != 0:
+                    strings_data.append({
+                        "String": f"PV String {i}",
+                        "Voltage (V)": round(v, 2),
+                        "Current (A)": round(c, 3),
+                        "Power (kW)":  p,
+                    })
+            if strings_data:
+                st.dataframe(pd.DataFrame(strings_data), use_container_width=True, hide_index=True)
+
+            # Phase voltages and currents
+            st.markdown("**Grid Phase Details**")
+            phase_data = []
+            for ph in ["a", "b", "c"]:
+                v = float(device_rt.get(f"{ph}PhaseVoltage", 0) or 0)
+                c = float(device_rt.get(f"{ph}PhaseCurrent", 0) or 0)
+                phase_data.append({
+                    "Phase": ph.upper(),
+                    "Voltage (V)": round(v, 2),
+                    "Current (A)": round(c, 3),
+                    "Power (kW)":  round(v * c / 1000, 3),
+                })
+            st.dataframe(pd.DataFrame(phase_data), use_container_width=True, hide_index=True)
+
+            pf = device_rt.get("powerFactor")
+            freq = device_rt.get("gridFrequency")
+            if pf or freq:
+                pf_col, freq_col = st.columns(2)
+                if pf:
+                    pf_col.metric("Power Factor", f"{float(pf):.3f}")
+                if freq:
+                    freq_col.metric("Grid Frequency", f"{float(freq):.2f} Hz")
+
+        # Summary metrics from system summary
+        if summary:
+            st.divider()
+            st.subheader("Today's Energy Summary")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Solar Today",      f"{summary.get('dailyPowerGeneration', 0):.1f} kWh")
+            s2.metric("Solar This Month",  f"{summary.get('monthlyPowerGeneration', 0):.1f} kWh")
+            s3.metric("Solar This Year",   f"{summary.get('annualPowerGeneration', 0):.1f} kWh")
+            s4.metric("Lifetime Solar",    f"{summary.get('lifetimePowerGeneration', 0):.1f} kWh")
+
+            env1, env2, env3 = st.columns(3)
+            env1.metric("CO2 Saved (lifetime)", f"{summary.get('lifetimeCo2', 0):.2f} tons")
+            env2.metric("Coal Saved (lifetime)", f"{summary.get('lifetimeCoal', 0):.2f} tons")
+            env3.metric("Trees Equivalent",      f"{summary.get('lifetimeTreeEquivalent', 0):.0f} trees")
+
+    # ── SECTION 2 — Weather ───────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Current Weather — Umhlanga")
+    w1, w2, w3, w4 = st.columns(4)
+    w1.metric("Temperature",   f"{weather.get('temperature', 0):.1f} degC")
+    w2.metric("Cloud Cover",   f"{weather.get('cloud_cover', 0):.0f}%")
+    w3.metric("Wind Speed",    f"{weather.get('wind_speed', 0):.1f} km/h")
+    w4.metric("Solar Irradiance", f"{weather.get('irradiance', 0):.0f} W/m2")
+
+    # ── SECTION 3 — 7-day history chart ──────────────────────────────────────
+    st.divider()
+    st.subheader("Last 7 Days — Solar Power vs Weather")
+
+    hist = load_history(days=7)
+    if not hist.empty:
+        hist["ts"] = pd.to_datetime(hist["ts"]).dt.tz_convert("Africa/Johannesburg")
+
+        fig_hist = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_hist.add_trace(
+            go.Scatter(x=hist["ts"], y=hist["pv_kw"],
+                       name="Solar (kW)", line=dict(color="#EF9F27", width=2)),
+            secondary_y=False
+        )
+        fig_hist.add_trace(
+            go.Scatter(x=hist["ts"], y=hist["load_kw"],
+                       name="Load (kW)", line=dict(color="#E24B4A", dash="dot")),
+            secondary_y=False
+        )
+        fig_hist.add_trace(
+            go.Scatter(x=hist["ts"], y=hist["cloud_cover"],
+                       name="Cloud Cover (%)", line=dict(color="#7F77DD", dash="dash"),
+                       opacity=0.7),
+            secondary_y=True
+        )
+        fig_hist.add_trace(
+            go.Scatter(x=hist["ts"], y=hist["irradiance"],
+                       name="Irradiance (W/m2)", line=dict(color="#3B8BD4", dash="dot"),
+                       opacity=0.7),
+            secondary_y=True
+        )
+        fig_hist.update_layout(
+            title="Solar Power vs Cloud Cover & Irradiance",
+            xaxis_title="Date / Time",
+            legend_title="Metric",
+            height=420,
+        )
+        fig_hist.update_yaxes(title_text="Power (kW)", secondary_y=False)
+        fig_hist.update_yaxes(title_text="Cloud % / Irradiance W/m2", secondary_y=True)
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+        # Battery SoC trend
+        fig_soc = go.Figure()
+        fig_soc.add_scatter(x=hist["ts"], y=hist["battery_soc"],
+                            name="Battery SoC (%)",
+                            fill="tozeroy", line=dict(color="#1D9E75"),
+                            fillcolor="rgba(29,158,117,0.2)")
+        fig_soc.update_layout(
+            title="Battery State of Charge — Last 7 Days",
+            xaxis_title="Date / Time",
+            yaxis=dict(title="SoC (%)", range=[0, 105]),
+            height=300,
+        )
+        st.plotly_chart(fig_soc, use_container_width=True)
+    else:
+        st.info("No historical live data yet — readings are stored each time this tab is refreshed. Check back in a few minutes.")
+
+    # Auto-refresh using Streamlit's rerun
+    if auto_refresh:
+        import time as _time
+        _time.sleep(30)
+        st.rerun()
 
 # ── Raw data (optional) ───────────────────────────────────────────────────────
 if show_raw:
