@@ -569,40 +569,36 @@ if tab1:
         )
         st.plotly_chart(fig_trend, use_container_width=True)
 
-    # ── Cumulative meter reading at a specific date ────────────────────────────
+    # ── Cumulative meter reading at a specific date — all 6 meters ────────────
     st.divider()
-    st.subheader("🔍 Cumulative meter reading at a specific date")
+    st.subheader("🔍 EMS import table — all meter readings at a specific date")
     st.caption(
-        "Shows the cumulative TOU meter reading from the meter start date "
-        "(5 Dec 2025 = 0) up to the END of the selected date — identical "
-        "to what the SFTP CSV would contain if pushed at close of that day. "
-        "Use this to verify a specific day's reading without waiting for the "
-        "next billing period summary."
+        "Select a date to see cumulative TOU readings for all 6 virtual meters "
+        "from the meter start (5 Dec 2025 = 0) to the end of that day — in the "
+        "same column order used for manual EMS import. Select all and copy "
+        "directly into your EMS spreadsheet."
     )
+
+    # Serial names exactly as they appear in the SFTP CSV
+    EMS_METERS = {
+        "GridImport":        "grid_import_kwh",
+        "GridExport":        "grid_export_kwh",
+        "Solar":             "solar_kwh",
+        "LoadConsumed":      "load_kwh",
+        "BatteryCharge":     "batt_charge_kwh",
+        "BatteryDischarge":  "batt_discharge_kwh",
+    }
 
     avail_dates = sorted(hourly["datetime"].dt.date.unique())
     if avail_dates:
-        date_col1, date_col2 = st.columns([2, 2])
-        with date_col1:
-            selected_date = st.date_input(
-                "Select date",
-                value=avail_dates[-1],
-                min_value=avail_dates[0],
-                max_value=avail_dates[-1],
-                help="Only dates with imported data are selectable.",
-            )
-        with date_col2:
-            lookup_col_label = st.selectbox(
-                "Energy channel",
-                options=list(METER_COLUMNS.keys()),
-                index=list(METER_COLUMNS.keys()).index(selected_label),
-                key="lookup_meter",
-                help="Defaults to the same channel selected above.",
-            )
-        lookup_col = METER_COLUMNS[lookup_col_label]
+        selected_date = st.date_input(
+            "Select reading date",
+            value=avail_dates[-1],
+            min_value=avail_dates[0],
+            max_value=avail_dates[-1],
+            key="ems_date",
+        )
 
-        # Cumulative from meter start (5 Dec 2025) to END of selected date —
-        # same logic as compute_meter_readings but for an arbitrary date
         start_date = pd.Timestamp("2025-12-05")
         end_dt     = pd.Timestamp(selected_date) + pd.Timedelta(days=1)
         cum_data   = hourly[
@@ -613,45 +609,41 @@ if tab1:
         if cum_data.empty:
             st.info(f"No data available up to {selected_date}.")
         else:
-            cum_total   = cum_data[lookup_col].sum()
-            cum_peak    = cum_data[cum_data["tou_slot"] == "1.8.1"][lookup_col].sum()
-            cum_std     = cum_data[cum_data["tou_slot"] == "1.8.2"][lookup_col].sum()
-            cum_offpeak = cum_data[cum_data["tou_slot"] == "1.8.3"][lookup_col].sum()
-            billing_run = hourly[hourly["datetime"].dt.date == selected_date]["billing_run"].iloc[0] \
-                          if "billing_run" in hourly.columns else "—"
+            reading_date_str = pd.Timestamp(selected_date).strftime("%d/%m/%Y") + " 23:59:59 GMT+2"
 
-            # Register prefix for display
-            reg = register_prefix
+            rows = []
+            for serial, col in EMS_METERS.items():
+                total   = round(cum_data[col].sum(), 3)
+                peak    = round(cum_data[cum_data["tou_slot"] == "1.8.1"][col].sum(), 3)
+                std     = round(cum_data[cum_data["tou_slot"] == "1.8.2"][col].sum(), 3)
+                offpeak = round(cum_data[cum_data["tou_slot"] == "1.8.3"][col].sum(), 3)
+                rows.append({
+                    "Meter Serial":   serial,
+                    "Reading Date":   reading_date_str,
+                    "Total (kWh)":    total,
+                    "Off-Peak (kWh)": offpeak,
+                    "Standard (kWh)": std,
+                    "Peak (kWh)":     peak,
+                })
 
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Reading date", str(selected_date))
-            m2.metric("Billing run", billing_run)
-            m3.metric(f"{reg}.0  Total", f"{cum_total:.3f} kWh")
-            m4.metric(f"{reg}.1  Peak", f"{cum_peak:.3f} kWh")
-            m5.metric(f"{reg}.2  Standard", f"{cum_std:.3f} kWh")
+            ems_df = pd.DataFrame(rows)
 
-            st.metric(f"{reg}.3  Off-Peak", f"{cum_offpeak:.3f} kWh")
-
-            st.caption(
-                f"This is the reading that would appear in the SFTP CSV for "
-                f"**{lookup_col_label}** if pushed at close of {selected_date}. "
-                f"Peak + Standard + Off-Peak = {cum_peak + cum_std + cum_offpeak:.3f} kWh "
-                f"({'✅ matches total' if abs((cum_peak + cum_std + cum_offpeak) - cum_total) < 0.01 else '⚠️ rounding difference'})."
+            st.dataframe(
+                ems_df.style.format({
+                    "Total (kWh)":    "{:.3f}",
+                    "Off-Peak (kWh)": "{:.3f}",
+                    "Standard (kWh)": "{:.3f}",
+                    "Peak (kWh)":     "{:.3f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
             )
 
-            # Download as a single-row CSV matching the SFTP format exactly
-            sftp_row = pd.DataFrame([{
-                "METER_ADDRESS": lookup_col_label.replace(" (kWh)", "").replace(" ", ""),
-                "READING_DATE":  f"{selected_date.strftime('%d/%m/%Y')} 23:59:59 GMT+2",
-                "READING_VALUE": round(cum_total, 3),
-                "PEAK":          round(cum_peak, 3),
-                "STD":           round(cum_std, 3),
-                "OFFPEAK":       round(cum_offpeak, 3),
-            }])
+            # Download as CSV ready to paste into EMS
             st.download_button(
-                f"⬇️ Download reading as SFTP-format CSV",
-                sftp_row.to_csv(index=False).encode("utf-8"),
-                file_name=f"{site_name}_{lookup_col}_{selected_date}_reading.csv",
+                "⬇️ Download EMS import CSV",
+                ems_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{site_name}_EMS_readings_{selected_date}.csv",
                 mime="text/csv",
             )
     else:
