@@ -1487,6 +1487,145 @@ if tab4:
 
     st.divider()
 
+    # ── ROUND-TRIP EFFICIENCY & LOSS ANALYSIS ─────────────────────────────────
+    st.subheader("⚖️ Round-trip efficiency & energy losses")
+    st.caption(
+        "The gap between charge and discharge is real and expected — it's not a "
+        "data error. Energy is lost as heat during the charge/discharge cycle "
+        "(round-trip losses: ~87-93% for healthy lithium systems), plus small "
+        "BMS overhead, cell balancing, and self-discharge. This table quantifies "
+        "those losses per billing period and splits them by charge source "
+        "(solar vs. grid) so you can see the rand cost of inefficiency separately "
+        "for each source. A falling RTE over time signals genuine cell degradation."
+    )
+
+    # Build the loss analysis from batt_usage_rows (Period Usage only —
+    # losses only make sense as a per-period delta, not a cumulative total)
+    loss_rows = []
+    for row in batt_usage_rows:
+        charge      = row["C Total (kWh)"]
+        discharge   = row["D Total (kWh)"]
+        c_grid      = row["C Grid Total (kWh)"]
+        c_solar     = row["C Solar Total (kWh)"]
+
+        rte         = round(100 * discharge / charge, 2) if charge > 0 else 0.0
+        loss_total  = round(charge - discharge, 3)
+
+        # Attribute losses proportionally to charge source
+        grid_frac   = (c_grid  / charge) if charge > 0 else 0
+        solar_frac  = (c_solar / charge) if charge > 0 else 0
+        loss_grid   = round(loss_total * grid_frac,  3)
+        loss_solar  = round(loss_total * solar_frac, 3)
+
+        # Rand cost of losses — grid losses cost the TOU tariff that was paid
+        # to charge that energy, solar losses cost the opportunity sell rate
+        grid_tariff_avg = (row["C Cost (R)"] / c_grid) if c_grid > 0 else 0
+        loss_grid_r     = round(loss_grid  * grid_tariff_avg, 2)
+        loss_solar_r    = round(loss_solar * get_sell_rate_for_date(
+            pd.Timestamp(row["Period End"])), 2)
+        loss_total_r    = round(loss_grid_r + loss_solar_r, 2)
+
+        rte_status = (
+            "✅ Healthy"   if rte >= 90 else
+            "🟡 Monitor"  if rte >= 85 else
+            "🔴 Degraded" if rte >   0 else
+            "—"
+        )
+
+        loss_rows.append({
+            "Billing Run":       row["Billing Run"],
+            "Period":            f"{row['Period Start']} → {row['Period End']}",
+            "Charged (kWh)":     round(charge, 3),
+            "Discharged (kWh)":  round(discharge, 3),
+            "RTE (%)":           rte,
+            "Status":            rte_status,
+            "Total Loss (kWh)":  loss_total,
+            "Grid Loss (kWh)":   loss_grid,
+            "Solar Loss (kWh)":  loss_solar,
+            "Grid Loss (R)":     loss_grid_r,
+            "Solar Loss (R)":    loss_solar_r,
+            "Total Loss (R)":    loss_total_r,
+        })
+
+    loss_df = pd.DataFrame(loss_rows)
+
+    def _rte_color(val):
+        try:
+            v = float(val)
+            if v >= 90:   return "color: #1D9E75"
+            elif v >= 85: return "color: #EF9F27"
+            elif v > 0:   return "color: #E24B4A"
+        except (TypeError, ValueError):
+            pass
+        return ""
+
+    loss_fmt = {
+        "Charged (kWh)":    "{:.3f}",
+        "Discharged (kWh)": "{:.3f}",
+        "RTE (%)":          "{:.2f}%",
+        "Total Loss (kWh)": "{:.3f}",
+        "Grid Loss (kWh)":  "{:.3f}",
+        "Solar Loss (kWh)": "{:.3f}",
+        "Grid Loss (R)":    "R {:,.2f}",
+        "Solar Loss (R)":   "R {:,.2f}",
+        "Total Loss (R)":   "R {:,.2f}",
+    }
+    st.dataframe(
+        loss_df.style.format(loss_fmt).map(_rte_color, subset=["RTE (%)"]),
+        use_container_width=True, hide_index=True,
+    )
+
+    # Summary metrics across all periods
+    if len(loss_df) > 0:
+        total_charged    = loss_df["Charged (kWh)"].sum()
+        total_discharged = loss_df["Discharged (kWh)"].sum()
+        overall_rte      = round(100 * total_discharged / total_charged, 2) if total_charged > 0 else 0
+        total_loss_kwh   = loss_df["Total Loss (kWh)"].sum()
+        total_loss_r     = loss_df["Total Loss (R)"].sum()
+        total_grid_loss_r  = loss_df["Grid Loss (R)"].sum()
+        total_solar_loss_r = loss_df["Solar Loss (R)"].sum()
+
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Overall RTE", f"{overall_rte:.2f}%",
+                  help="Discharge ÷ Charge across all billing periods")
+        s2.metric("Total energy lost", f"{total_loss_kwh:.1f} kWh")
+        s3.metric("Total loss cost", f"R {total_loss_r:,.2f}")
+        s4.metric("Grid loss cost",  f"R {total_grid_loss_r:,.2f}",
+                  help="Cost of energy charged from grid but lost before discharge")
+        s5.metric("Solar loss cost", f"R {total_solar_loss_r:,.2f}",
+                  help="Opportunity cost of solar energy lost to round-trip inefficiency")
+
+        # RTE trend chart
+        fig_rte = go.Figure()
+        fig_rte.add_scatter(
+            x=loss_df["Billing Run"], y=loss_df["RTE (%)"],
+            mode="lines+markers", name="RTE %",
+            line=dict(color="#1D9E75", width=2), marker=dict(size=8),
+        )
+        fig_rte.add_hline(y=90, line_dash="dash", line_color="#1D9E75",
+                          annotation_text="Healthy threshold (90%)")
+        fig_rte.add_hline(y=85, line_dash="dash", line_color="#EF9F27",
+                          annotation_text="Monitor threshold (85%)")
+        fig_rte.update_layout(
+            height=300, yaxis=dict(title="RTE (%)", range=[75, 100]),
+            xaxis_title="Billing Run",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=10), showlegend=False,
+            title="Round-trip efficiency trend — declining trend signals cell degradation",
+        )
+        fig_rte.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_rte.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        st.plotly_chart(fig_rte, use_container_width=True)
+
+    csv_loss = loss_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download loss analysis CSV", csv_loss,
+        file_name=f"{site_name}_battery_losses.csv",
+        mime="text/csv", key="dl_loss",
+    )
+
+    st.divider()
+
     # ── Date range controls ───────────────────────────────────────────────────
     batt_min = daily["date"].min().to_pydatetime()
     batt_max = daily["date"].max().to_pydatetime()
