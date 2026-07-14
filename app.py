@@ -569,13 +569,15 @@ if tab1:
         )
         st.plotly_chart(fig_trend, use_container_width=True)
 
-    # ── Date lookup ───────────────────────────────────────────────────────────
+    # ── Cumulative meter reading at a specific date ────────────────────────────
     st.divider()
-    st.subheader("🔍 Date lookup — hourly readings for a specific day")
+    st.subheader("🔍 Cumulative meter reading at a specific date")
     st.caption(
-        "Select a date to see every hourly reading imported for that day, "
-        "broken down by TOU slot. Useful for verifying a specific day's data "
-        "or investigating a spike/anomaly you noticed in the billing totals."
+        "Shows the cumulative TOU meter reading from the meter start date "
+        "(5 Dec 2025 = 0) up to the END of the selected date — identical "
+        "to what the SFTP CSV would contain if pushed at close of that day. "
+        "Use this to verify a specific day's reading without waiting for the "
+        "next billing period summary."
     )
 
     avail_dates = sorted(hourly["datetime"].dt.date.unique())
@@ -599,95 +601,57 @@ if tab1:
             )
         lookup_col = METER_COLUMNS[lookup_col_label]
 
-        day_data = hourly[hourly["datetime"].dt.date == selected_date].copy()
+        # Cumulative from meter start (5 Dec 2025) to END of selected date —
+        # same logic as compute_meter_readings but for an arbitrary date
+        start_date = pd.Timestamp("2025-12-05")
+        end_dt     = pd.Timestamp(selected_date) + pd.Timedelta(days=1)
+        cum_data   = hourly[
+            (hourly["datetime"] >= start_date) &
+            (hourly["datetime"] < end_dt)
+        ]
 
-        if day_data.empty:
-            st.info(f"No data available for {selected_date}.")
+        if cum_data.empty:
+            st.info(f"No data available up to {selected_date}.")
         else:
-            day_data = day_data.sort_values("datetime").reset_index(drop=True)
+            cum_total   = cum_data[lookup_col].sum()
+            cum_peak    = cum_data[cum_data["tou_slot"] == "1.8.1"][lookup_col].sum()
+            cum_std     = cum_data[cum_data["tou_slot"] == "1.8.2"][lookup_col].sum()
+            cum_offpeak = cum_data[cum_data["tou_slot"] == "1.8.3"][lookup_col].sum()
+            billing_run = hourly[hourly["datetime"].dt.date == selected_date]["billing_run"].iloc[0] \
+                          if "billing_run" in hourly.columns else "—"
 
-            # Build the display table
-            lookup_df = pd.DataFrame({
-                "Time": day_data["datetime"].dt.strftime("%H:%M"),
-                "TOU Slot": day_data["tou_slot"].map(
-                    {"1.8.1": "🔴 Peak", "1.8.2": "🟡 Standard", "1.8.3": "🟢 Off-Peak"}
-                ),
-                "Season": day_data["season"].str.capitalize(),
-                lookup_col_label + " (kWh)": day_data[lookup_col].round(4),
-                "Running total (kWh)": day_data[lookup_col].cumsum().round(4),
-            })
-
-            # Summary row stats
-            day_total = day_data[lookup_col].sum()
-            peak_total    = day_data[day_data["tou_slot"] == "1.8.1"][lookup_col].sum()
-            std_total     = day_data[day_data["tou_slot"] == "1.8.2"][lookup_col].sum()
-            offpeak_total = day_data[day_data["tou_slot"] == "1.8.3"][lookup_col].sum()
-            billing_run   = day_data["billing_run"].iloc[0] if "billing_run" in day_data.columns else "—"
+            # Register prefix for display
+            reg = register_prefix
 
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Date", str(selected_date))
+            m1.metric("Reading date", str(selected_date))
             m2.metric("Billing run", billing_run)
-            m3.metric("🔴 Peak", f"{peak_total:.3f} kWh")
-            m4.metric("🟡 Standard", f"{std_total:.3f} kWh")
-            m5.metric("🟢 Off-Peak", f"{offpeak_total:.3f} kWh")
+            m3.metric(f"{reg}.0  Total", f"{cum_total:.3f} kWh")
+            m4.metric(f"{reg}.1  Peak", f"{cum_peak:.3f} kWh")
+            m5.metric(f"{reg}.2  Standard", f"{cum_std:.3f} kWh")
 
-            # Colour rows by TOU slot
-            def _tou_row_color(row):
-                colors = {
-                    "🔴 Peak":     "background-color: rgba(226,75,74,0.12)",
-                    "🟡 Standard": "background-color: rgba(239,159,39,0.12)",
-                    "🟢 Off-Peak": "background-color: rgba(29,158,117,0.12)",
-                }
-                return [colors.get(row["TOU Slot"], "")] * len(row)
+            st.metric(f"{reg}.3  Off-Peak", f"{cum_offpeak:.3f} kWh")
 
-            st.dataframe(
-                lookup_df.style.apply(_tou_row_color, axis=1),
-                use_container_width=True,
-                hide_index=True,
-                height=420,
+            st.caption(
+                f"This is the reading that would appear in the SFTP CSV for "
+                f"**{lookup_col_label}** if pushed at close of {selected_date}. "
+                f"Peak + Standard + Off-Peak = {cum_peak + cum_std + cum_offpeak:.3f} kWh "
+                f"({'✅ matches total' if abs((cum_peak + cum_std + cum_offpeak) - cum_total) < 0.01 else '⚠️ rounding difference'})."
             )
 
-            # Hourly bar chart for the selected day, coloured by TOU slot
-            bar_colors = day_data["tou_slot"].map(
-                {"1.8.1": "#E24B4A", "1.8.2": "#EF9F27", "1.8.3": "#1D9E75"}
-            )
-            fig_day = go.Figure()
-            fig_day.add_bar(
-                x=day_data["datetime"].dt.strftime("%H:%M"),
-                y=day_data[lookup_col],
-                marker_color=bar_colors,
-                text=day_data["tou_slot"].map(
-                    {"1.8.1": "Peak", "1.8.2": "Std", "1.8.3": "OffPk"}
-                ),
-                textposition="outside",
-                hovertemplate=(
-                    "<b>%{x}</b><br>"
-                    + lookup_col_label + ": %{y:.4f} kWh<br>"
-                    "<extra></extra>"
-                ),
-            )
-            fig_day.update_layout(
-                height=320,
-                xaxis_title="Hour",
-                yaxis_title=f"{lookup_col_label} (kWh)",
-                showlegend=False,
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=10, b=10),
-                title=f"{lookup_col_label} — {selected_date}  |  "
-                      f"Total: {day_total:.3f} kWh  "
-                      f"(Peak {peak_total:.3f} / Std {std_total:.3f} / OffPk {offpeak_total:.3f})",
-            )
-            fig_day.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-            fig_day.update_yaxes(gridcolor="rgba(255,255,255,0.06)", rangemode="tozero")
-            st.plotly_chart(fig_day, use_container_width=True)
-
-            # Download this day's data
-            day_csv = lookup_df.to_csv(index=False).encode("utf-8")
+            # Download as a single-row CSV matching the SFTP format exactly
+            sftp_row = pd.DataFrame([{
+                "METER_ADDRESS": lookup_col_label.replace(" (kWh)", "").replace(" ", ""),
+                "READING_DATE":  f"{selected_date.strftime('%d/%m/%Y')} 23:59:59 GMT+2",
+                "READING_VALUE": round(cum_total, 3),
+                "PEAK":          round(cum_peak, 3),
+                "STD":           round(cum_std, 3),
+                "OFFPEAK":       round(cum_offpeak, 3),
+            }])
             st.download_button(
-                f"⬇️ Download {selected_date} hourly data",
-                day_csv,
-                file_name=f"{site_name}_{lookup_col}_{selected_date}.csv",
+                f"⬇️ Download reading as SFTP-format CSV",
+                sftp_row.to_csv(index=False).encode("utf-8"),
+                file_name=f"{site_name}_{lookup_col}_{selected_date}_reading.csv",
                 mime="text/csv",
             )
     else:
