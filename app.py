@@ -14,41 +14,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ── Mobile-friendly CSS ────────────────────────────────────────────────────────
-# Makes the app readable and usable on phones/tablets without horizontal
-# scrolling. Keeps full-width layout on desktop untouched.
-st.markdown("""
-<style>
-/* ── Responsive layout ───────────────────────────────────────── */
-@media (max-width: 768px) {
-    /* Remove the fixed padding Streamlit adds, let content fill screen */
-    .block-container { padding: 0.5rem 0.5rem 2rem !important; }
-    /* Stack columns vertically on mobile instead of side by side */
-    [data-testid="column"] { min-width: 100% !important; flex: 100% !important; }
-    /* Make dataframes scrollable horizontally instead of overflowing */
-    [data-testid="stDataFrame"] { overflow-x: auto !important; }
-    /* Smaller headings on small screens */
-    h1 { font-size: 1.4rem !important; }
-    h2 { font-size: 1.2rem !important; }
-    h3 { font-size: 1.0rem !important; }
-    /* Make metric cards stack more naturally */
-    [data-testid="metric-container"] { min-width: 120px !important; }
-    /* Plotly charts: allow horizontal scroll rather than squishing */
-    .js-plotly-plot { overflow-x: auto !important; }
-}
-/* ── Sidebar nav styling ─────────────────────────────────────── */
-[data-testid="stSidebar"] .stRadio label {
-    font-size: 0.95rem;
-    padding: 0.35rem 0.5rem;
-    border-radius: 6px;
-    display: block;
-}
-[data-testid="stSidebar"] .stRadio label:hover {
-    background-color: rgba(255,255,255,0.07);
-}
-</style>
-""", unsafe_allow_html=True)
-
 # ─── TOU CLASSIFICATION ───────────────────────────────────────────────────────
 
 def get_season(dt):
@@ -350,21 +315,6 @@ with st.sidebar:
     st.header("⚙️ Settings")
     show_raw = st.checkbox("Show raw hourly data", value=False)
 
-    st.divider()
-    st.header("📌 Navigation")
-    page = st.radio(
-        "Go to",
-        options=[
-            "🔢 Meter Readings",
-            "📊 System Performance",
-            "💰 Profitability",
-            "🔋 Battery Health",
-            "🌤️ Seasonal Patterns",
-            "⚡ Live Dashboard",
-        ],
-        label_visibility="collapsed",
-    )
-
 # ── Load ───────────────────────────────────────────────────────────────────────
 with st.spinner("Loading data..."):
     daily, hourly = load_data(DATA_FILE)
@@ -412,20 +362,21 @@ TARIFF = {
 }
 SELL_RATE = 3.2795  # R/kWh — flat sell rate regardless of season/TOU
 
-# ─── PAGE ROUTING ─────────────────────────────────────────────────────────────
-# Navigation is handled by the sidebar radio above; each page renders only
-# when selected, keeping the app fast and sidebar-friendly on mobile.
-tab1 = page == "🔢 Meter Readings"
-tab2 = page == "📊 System Performance"
-tab3 = page == "💰 Profitability"
-tab4 = page == "🔋 Battery Health"
-tab5 = page == "🌤️ Seasonal Patterns"
-tab6 = page == "⚡ Live Dashboard"
+# ─── TABS ─────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "🔢 Meter Readings",
+    "📊 System Performance",
+    "💰 Profitability",
+    "🔋 Battery Health",
+    "🌤️ Seasonal Patterns",
+    "⚡ Live Dashboard",
+    "🏢 Argo",
+])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — METER READINGS
 # ══════════════════════════════════════════════════════════════════════════════
-if tab1:
+with tab1:
     st.subheader("Virtual Meter — TOU Breakdown")
 
     # ── Controls row ──────────────────────────────────────────────────────────
@@ -569,91 +520,11 @@ if tab1:
         )
         st.plotly_chart(fig_trend, use_container_width=True)
 
-    # ── Cumulative meter reading at a specific date — all 6 meters ────────────
-    st.divider()
-    st.subheader("🔍 EMS import table — all meter readings at a specific date")
-    st.caption(
-        "Select a date to see cumulative TOU readings for all 6 virtual meters "
-        "from the meter start (5 Dec 2025 = 0) to the end of that day — in the "
-        "same column order used for manual EMS import. Select all and copy "
-        "directly into your EMS spreadsheet."
-    )
-
-    # Serial names exactly as they appear in the SFTP CSV
-    EMS_METERS = {
-        "GridImport":        "grid_import_kwh",
-        "GridExport":        "grid_export_kwh",
-        "Solar":             "solar_kwh",
-        "LoadConsumed":      "load_kwh",
-        "BatteryCharge":     "batt_charge_kwh",
-        "BatteryDischarge":  "batt_discharge_kwh",
-    }
-
-    avail_dates = sorted(hourly["datetime"].dt.date.unique())
-    if avail_dates:
-        selected_date = st.date_input(
-            "Select reading date",
-            value=avail_dates[-1],
-            min_value=avail_dates[0],
-            max_value=avail_dates[-1],
-            key="ems_date",
-        )
-
-        start_date = pd.Timestamp("2025-12-05")
-        end_dt     = pd.Timestamp(selected_date) + pd.Timedelta(days=1)
-        cum_data   = hourly[
-            (hourly["datetime"] >= start_date) &
-            (hourly["datetime"] < end_dt)
-        ]
-
-        if cum_data.empty:
-            st.info(f"No data available up to {selected_date}.")
-        else:
-            reading_date_str = pd.Timestamp(selected_date).strftime("%d/%m/%Y") + " 23:59:59 GMT+2"
-
-            rows = []
-            for serial, col in EMS_METERS.items():
-                total   = round(cum_data[col].sum(), 3)
-                peak    = round(cum_data[cum_data["tou_slot"] == "1.8.1"][col].sum(), 3)
-                std     = round(cum_data[cum_data["tou_slot"] == "1.8.2"][col].sum(), 3)
-                offpeak = round(cum_data[cum_data["tou_slot"] == "1.8.3"][col].sum(), 3)
-                rows.append({
-                    "Meter Serial":   serial,
-                    "Reading Date":   reading_date_str,
-                    "Total (kWh)":    total,
-                    "Off-Peak (kWh)": offpeak,
-                    "Standard (kWh)": std,
-                    "Peak (kWh)":     peak,
-                })
-
-            ems_df = pd.DataFrame(rows)
-
-            st.dataframe(
-                ems_df.style.format({
-                    "Total (kWh)":    "{:.3f}",
-                    "Off-Peak (kWh)": "{:.3f}",
-                    "Standard (kWh)": "{:.3f}",
-                    "Peak (kWh)":     "{:.3f}",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            # Download as CSV ready to paste into EMS
-            st.download_button(
-                "⬇️ Download EMS import CSV",
-                ems_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"{site_name}_EMS_readings_{selected_date}.csv",
-                mime="text/csv",
-            )
-    else:
-        st.info("No hourly data loaded yet.")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — SYSTEM PERFORMANCE
 # ══════════════════════════════════════════════════════════════════════════════
-if tab2:
+with tab2:
     st.subheader("System Performance Overview")
 
     # ── Date range slider ─────────────────────────────────────────────────────
@@ -728,13 +599,13 @@ if tab2:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PROFITABILITY
 # ══════════════════════════════════════════════════════════════════════════════
-if tab3:
+with tab3:
     st.subheader("Revenue & Profitability")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PROFITABILITY
 # ══════════════════════════════════════════════════════════════════════════════
-if tab3:
+with tab3:
     st.subheader("💰 Profitability Analysis")
     st.caption("All calculations derived from actual metered data and your input parameters — not from the inverter revenue column.")
 
@@ -1219,7 +1090,7 @@ if tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — BATTERY HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
-if tab4:
+with tab4:
     st.subheader("Battery Health & Cycle Tracking")
 
     # ── Battery parameters ────────────────────────────────────────────────────
@@ -1483,144 +1354,6 @@ if tab4:
         f"⬇️ Download Discharge {batt_table_mode} CSV", csv_discharge,
         file_name=f"{site_name}_battery_discharge_{batt_table_mode.lower().replace(' ','_')}.csv",
         mime="text/csv", key="dl_discharge",
-    )
-
-    st.divider()
-
-    # ── ROUND-TRIP EFFICIENCY & LOSS ANALYSIS ─────────────────────────────────
-    st.subheader("⚖️ Round-trip efficiency & energy losses")
-    st.caption(
-        "The gap between charge and discharge is real and expected — it's not a "
-        "data error. Energy is lost as heat during the charge/discharge cycle "
-        "(round-trip losses: ~87-93% for healthy lithium systems), plus small "
-        "BMS overhead, cell balancing, and self-discharge. This table quantifies "
-        "those losses per billing period and splits them by charge source "
-        "(solar vs. grid) so you can see the rand cost of inefficiency separately "
-        "for each source. A falling RTE over time signals genuine cell degradation."
-    )
-
-    # Build the loss analysis from batt_usage_rows (Period Usage only —
-    # losses only make sense as a per-period delta, not a cumulative total)
-    loss_rows = []
-    for row in batt_usage_rows:
-        charge      = row["C Total (kWh)"]
-        discharge   = row["D Total (kWh)"]
-        c_grid      = row["C Grid Total (kWh)"]
-        c_solar     = row["C Solar Total (kWh)"]
-
-        rte         = round(100 * discharge / charge, 2) if charge > 0 else 0.0
-        loss_total  = round(charge - discharge, 3)
-
-        # Attribute losses proportionally to charge source
-        grid_frac   = (c_grid  / charge) if charge > 0 else 0
-        solar_frac  = (c_solar / charge) if charge > 0 else 0
-        loss_grid   = round(loss_total * grid_frac,  3)
-        loss_solar  = round(loss_total * solar_frac, 3)
-
-        # Rand cost of losses — grid losses cost the TOU tariff that was paid
-        # to charge that energy, solar losses cost the opportunity sell rate
-        grid_tariff_avg = (row["C Cost (R)"] / c_grid) if c_grid > 0 else 0
-        loss_grid_r     = round(loss_grid  * grid_tariff_avg, 2)
-        loss_solar_r    = round(loss_solar * SELL_RATE, 2)
-        loss_total_r    = round(loss_grid_r + loss_solar_r, 2)
-
-        rte_status = (
-            "✅ Healthy"   if rte >= 90 else
-            "🟡 Monitor"  if rte >= 85 else
-            "🔴 Degraded" if rte >   0 else
-            "—"
-        )
-
-        loss_rows.append({
-            "Billing Run":       row["Billing Run"],
-            "Period":            f"{row['Period Start']} → {row['Period End']}",
-            "Charged (kWh)":     round(charge, 3),
-            "Discharged (kWh)":  round(discharge, 3),
-            "RTE (%)":           rte,
-            "Status":            rte_status,
-            "Total Loss (kWh)":  loss_total,
-            "Grid Loss (kWh)":   loss_grid,
-            "Solar Loss (kWh)":  loss_solar,
-            "Grid Loss (R)":     loss_grid_r,
-            "Solar Loss (R)":    loss_solar_r,
-            "Total Loss (R)":    loss_total_r,
-        })
-
-    loss_df = pd.DataFrame(loss_rows)
-
-    def _rte_color(val):
-        try:
-            v = float(val)
-            if v >= 90:   return "color: #1D9E75"
-            elif v >= 85: return "color: #EF9F27"
-            elif v > 0:   return "color: #E24B4A"
-        except (TypeError, ValueError):
-            pass
-        return ""
-
-    loss_fmt = {
-        "Charged (kWh)":    "{:.3f}",
-        "Discharged (kWh)": "{:.3f}",
-        "RTE (%)":          "{:.2f}%",
-        "Total Loss (kWh)": "{:.3f}",
-        "Grid Loss (kWh)":  "{:.3f}",
-        "Solar Loss (kWh)": "{:.3f}",
-        "Grid Loss (R)":    "R {:,.2f}",
-        "Solar Loss (R)":   "R {:,.2f}",
-        "Total Loss (R)":   "R {:,.2f}",
-    }
-    st.dataframe(
-        loss_df.style.format(loss_fmt).map(_rte_color, subset=["RTE (%)"]),
-        use_container_width=True, hide_index=True,
-    )
-
-    # Summary metrics across all periods
-    if len(loss_df) > 0:
-        total_charged    = loss_df["Charged (kWh)"].sum()
-        total_discharged = loss_df["Discharged (kWh)"].sum()
-        overall_rte      = round(100 * total_discharged / total_charged, 2) if total_charged > 0 else 0
-        total_loss_kwh   = loss_df["Total Loss (kWh)"].sum()
-        total_loss_r     = loss_df["Total Loss (R)"].sum()
-        total_grid_loss_r  = loss_df["Grid Loss (R)"].sum()
-        total_solar_loss_r = loss_df["Solar Loss (R)"].sum()
-
-        s1, s2, s3, s4, s5 = st.columns(5)
-        s1.metric("Overall RTE", f"{overall_rte:.2f}%",
-                  help="Discharge ÷ Charge across all billing periods")
-        s2.metric("Total energy lost", f"{total_loss_kwh:.1f} kWh")
-        s3.metric("Total loss cost", f"R {total_loss_r:,.2f}")
-        s4.metric("Grid loss cost",  f"R {total_grid_loss_r:,.2f}",
-                  help="Cost of energy charged from grid but lost before discharge")
-        s5.metric("Solar loss cost", f"R {total_solar_loss_r:,.2f}",
-                  help="Opportunity cost of solar energy lost to round-trip inefficiency")
-
-        # RTE trend chart
-        fig_rte = go.Figure()
-        fig_rte.add_scatter(
-            x=loss_df["Billing Run"], y=loss_df["RTE (%)"],
-            mode="lines+markers", name="RTE %",
-            line=dict(color="#1D9E75", width=2), marker=dict(size=8),
-        )
-        fig_rte.add_hline(y=90, line_dash="dash", line_color="#1D9E75",
-                          annotation_text="Healthy threshold (90%)")
-        fig_rte.add_hline(y=85, line_dash="dash", line_color="#EF9F27",
-                          annotation_text="Monitor threshold (85%)")
-        fig_rte.update_layout(
-            height=300, yaxis=dict(title="RTE (%)", range=[75, 100]),
-            xaxis_title="Billing Run",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=10, b=10), showlegend=False,
-            title="Round-trip efficiency trend — declining trend signals cell degradation",
-        )
-        fig_rte.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_rte.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-        st.plotly_chart(fig_rte, use_container_width=True)
-
-    csv_loss = loss_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download loss analysis CSV", csv_loss,
-        file_name=f"{site_name}_battery_losses.csv",
-        mime="text/csv", key="dl_loss",
     )
 
     st.divider()
@@ -2010,7 +1743,7 @@ if tab4:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — SEASONAL PATTERNS
 # ══════════════════════════════════════════════════════════════════════════════
-if tab5:
+with tab5:
     st.subheader("Seasonal Patterns & Weather Influence")
 
     daily["month"]        = daily["date"].dt.month
@@ -2162,7 +1895,7 @@ if tab5:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — LIVE DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
-if tab6:
+with tab6:
     import requests as _requests
     import sqlite3
     import json as _json_live
@@ -3326,3 +3059,137 @@ if show_raw:
     st.divider()
     st.subheader("Raw Hourly Data")
     st.dataframe(hourly, use_container_width=True)
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — ARGO
+# ══════════════════════════════════════════════════════════════════════════════
+with tab7:
+    st.subheader("🏢 Argo Solar Billing Analysis")
+    st.caption(
+        "Monthly breakdown of energy billed by Argo under the PPA agreement: "
+        "all solar produced + solar-sourced peak battery discharge, both at "
+        "municipal bulk TOU rate − 15%. Compared against what the same energy "
+        "would have cost at full municipal rates to quantify the saving."
+    )
+
+    ARGO_DISCOUNT = 0.15
+
+    season_filter = st.radio(
+        "Season filter",
+        options=["All months", "High demand (Jun–Aug)", "Low demand (Sep–May)"],
+        horizontal=True, key="argo_season",
+    )
+
+    _h = hourly.copy()
+    _charge_total = _h["batt_charge_kwh"].replace(0, np.nan)
+    _h["solar_to_batt"] = np.minimum(_h["batt_charge_kwh"], _h["solar_kwh"])
+    _h["solar_frac"]    = (_h["solar_to_batt"] / _charge_total).fillna(0).clip(0, 1)
+    _tariff_map = {(s, t): TARIFF[s][t] for s in ["low","high"] for t in ["1.8.1","1.8.2","1.8.3"]}
+    _h["tariff_rkwh"]            = [_tariff_map.get((s,t),0) for s,t in zip(_h["season"],_h["tou_slot"])]
+    _h["solar_full_r"]           = _h["solar_kwh"] * _h["tariff_rkwh"]
+    _h["solar_argo_r"]           = _h["solar_full_r"] * (1 - ARGO_DISCOUNT)
+    _h["disc_solar_peak_kwh"]    = np.where(_h["tou_slot"]=="1.8.1", _h["batt_discharge_kwh"]*_h["solar_frac"], 0.0)
+    _h["disc_solar_peak_full_r"] = _h["disc_solar_peak_kwh"] * _h["tariff_rkwh"]
+    _h["disc_solar_peak_argo_r"] = _h["disc_solar_peak_full_r"] * (1 - ARGO_DISCOUNT)
+    _h["month"]        = _h["datetime"].dt.to_period("M")
+    _h["month_season"] = _h["datetime"].dt.month.map(lambda m: "High" if m in [6,7,8] else "Low")
+
+    _hf = _h.copy()
+    if season_filter == "High demand (Jun–Aug)":
+        _hf = _hf[_hf["month_season"] == "High"]
+    elif season_filter == "Low demand (Sep–May)":
+        _hf = _hf[_hf["month_season"] == "Low"]
+
+    if _hf.empty:
+        st.info("No data available for the selected season filter.")
+    else:
+        argo_rows = []
+        for month, grp in _hf.groupby("month"):
+            season    = grp["month_season"].iloc[0]
+            pk = TARIFF["high" if season=="High" else "low"]["1.8.1"]
+            st_ = TARIFF["high" if season=="High" else "low"]["1.8.2"]
+            op = TARIFF["high" if season=="High" else "low"]["1.8.3"]
+            sol_total = grp["solar_kwh"].sum()
+            sol_peak  = grp[grp["tou_slot"]=="1.8.1"]["solar_kwh"].sum()
+            sol_std   = grp[grp["tou_slot"]=="1.8.2"]["solar_kwh"].sum()
+            sol_opk   = grp[grp["tou_slot"]=="1.8.3"]["solar_kwh"].sum()
+            sol_full  = grp["solar_full_r"].sum()
+            sol_argo  = grp["solar_argo_r"].sum()
+            disc_kwh  = grp["disc_solar_peak_kwh"].sum()
+            disc_full = grp["disc_solar_peak_full_r"].sum()
+            disc_argo = grp["disc_solar_peak_argo_r"].sum()
+            t_full    = sol_full + disc_full
+            t_argo    = sol_argo + disc_argo
+            saving    = t_full  - t_argo
+            argo_rows.append({
+                "Month": str(month), "Season": season,
+                "Peak rate (R/kWh)": round(pk,4), "Std rate (R/kWh)": round(st_,4), "Off-Peak rate (R/kWh)": round(op,4),
+                "Solar Total (kWh)": round(sol_total,3),
+                "Solar — Peak (kWh)": round(sol_peak,3), "Solar — Std (kWh)": round(sol_std,3), "Solar — Off-Peak (kWh)": round(sol_opk,3),
+                "Solar @ full rate (R)": round(sol_full,2), "Solar @ Argo −15% (R)": round(sol_argo,2), "Solar saving (R)": round(sol_full-sol_argo,2),
+                "Disc. solar-peak (kWh)": round(disc_kwh,3),
+                "Disc. @ full rate (R)": round(disc_full,2), "Disc. @ Argo −15% (R)": round(disc_argo,2), "Disc. saving (R)": round(disc_full-disc_argo,2),
+                "Argo Invoice Total (R)": round(t_argo,2), "Full municipal cost (R)": round(t_full,2), "Total saving (R)": round(saving,2),
+            })
+
+        argo_df = pd.DataFrame(argo_rows)
+
+        st.subheader("📋 Monthly Argo invoice")
+        fmt_r, fmt_k = "R {:,.2f}", "{:.3f}"
+        argo_fmt = {
+            "Peak rate (R/kWh)":"{:.4f}","Std rate (R/kWh)":"{:.4f}","Off-Peak rate (R/kWh)":"{:.4f}",
+            "Solar Total (kWh)":fmt_k,"Solar — Peak (kWh)":fmt_k,"Solar — Std (kWh)":fmt_k,"Solar — Off-Peak (kWh)":fmt_k,
+            "Solar @ full rate (R)":fmt_r,"Solar @ Argo −15% (R)":fmt_r,"Solar saving (R)":fmt_r,
+            "Disc. solar-peak (kWh)":fmt_k,"Disc. @ full rate (R)":fmt_r,"Disc. @ Argo −15% (R)":fmt_r,"Disc. saving (R)":fmt_r,
+            "Argo Invoice Total (R)":fmt_r,"Full municipal cost (R)":fmt_r,"Total saving (R)":fmt_r,
+        }
+        def _sc(val):
+            try: return "color: #1D9E75" if float(val)>0 else "color: #E24B4A"
+            except: return ""
+        st.dataframe(
+            argo_df.style.format(argo_fmt).map(_sc, subset=["Total saving (R)","Solar saving (R)","Disc. saving (R)"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("---")
+        t_sol   = argo_df["Solar Total (kWh)"].sum()
+        t_disc  = argo_df["Disc. solar-peak (kWh)"].sum()
+        t_argo  = argo_df["Argo Invoice Total (R)"].sum()
+        t_full  = argo_df["Full municipal cost (R)"].sum()
+        t_save  = argo_df["Total saving (R)"].sum()
+        t_pct   = 100*t_save/t_full if t_full>0 else 0
+        n_m     = max(len(argo_df),1)
+        c1,c2,c3,c4,c5,c6 = st.columns(6)
+        c1.metric("Solar produced", f"{t_sol:,.1f} kWh")
+        c2.metric("Solar peak discharge", f"{t_disc:,.1f} kWh")
+        c3.metric("Argo invoice total", f"R {t_argo:,.2f}")
+        c4.metric("Full municipal cost", f"R {t_full:,.2f}")
+        c5.metric("Total saving", f"R {t_save:,.2f}", delta=f"{t_pct:.1f}% cheaper")
+        c6.metric("Avg saving / month", f"R {t_save/n_m:,.2f}")
+
+        st.markdown("---")
+        st.subheader("📈 Monthly invoice vs full municipal cost")
+        fig_argo = go.Figure()
+        fig_argo.add_bar(x=argo_df["Month"],y=argo_df["Argo Invoice Total (R)"],name="Argo invoice (paid)",marker_color="#1D9E75")
+        fig_argo.add_bar(x=argo_df["Month"],y=argo_df["Total saving (R)"],name="Saving (15% discount)",marker_color="rgba(239,159,39,0.7)")
+        fig_argo.add_scatter(x=argo_df["Month"],y=argo_df["Full municipal cost (R)"],name="Full rate cost",mode="lines+markers",line=dict(color="#E24B4A",width=2,dash="dot"))
+        fig_argo.update_layout(barmode="stack",height=380,yaxis_title="Rand (R)",legend=dict(orientation="h",yanchor="bottom",y=1.02,x=0),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",margin=dict(t=10,b=10))
+        fig_argo.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_argo.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        st.plotly_chart(fig_argo, use_container_width=True)
+
+        st.subheader("☀️ Solar production by TOU slot — monthly")
+        fig_sol = go.Figure()
+        fig_sol.add_bar(x=argo_df["Month"],y=argo_df["Solar — Peak (kWh)"],name="Peak",marker_color="#E24B4A")
+        fig_sol.add_bar(x=argo_df["Month"],y=argo_df["Solar — Std (kWh)"],name="Standard",marker_color="#EF9F27")
+        fig_sol.add_bar(x=argo_df["Month"],y=argo_df["Solar — Off-Peak (kWh)"],name="Off-Peak",marker_color="#1D9E75")
+        fig_sol.update_layout(barmode="stack",height=320,yaxis_title="kWh",legend=dict(orientation="h",yanchor="bottom",y=1.02,x=0),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",margin=dict(t=10,b=10))
+        fig_sol.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_sol.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        st.plotly_chart(fig_sol, use_container_width=True)
+
+        st.download_button(
+            "⬇️ Download Argo billing CSV",
+            argo_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{site_name}_argo_billing.csv",
+            mime="text/csv",
+        )
