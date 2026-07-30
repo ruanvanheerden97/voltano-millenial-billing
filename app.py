@@ -3060,39 +3060,76 @@ if show_raw:
     st.subheader("Raw Hourly Data")
     st.dataframe(hourly, use_container_width=True)
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 7 — ARGO
 # ══════════════════════════════════════════════════════════════════════════════
 with tab7:
-    st.subheader("🏢 Argo Solar Billing Analysis")
+    st.header("🏢 Argo Solar Billing")
     st.caption(
-        "Monthly breakdown of energy billed by Argo under the PPA agreement: "
-        "all solar produced + solar-sourced peak battery discharge, both at "
-        "municipal bulk TOU rate − 15%. Compared against what the same energy "
-        "would have cost at full municipal rates to quantify the saving."
+        "Two invoices flow between Voltano and Argo each month, plus a "
+        "standalone section showing the gross value the solar+battery system "
+        "delivers at full municipal rates — what you would have paid Eskom "
+        "for the same energy if you owned the system outright."
     )
 
     ARGO_DISCOUNT = 0.15
 
+    # ── Season filter ──────────────────────────────────────────────────────────
     season_filter = st.radio(
-        "Season filter",
-        options=["All months", "High demand (Jun–Aug)", "Low demand (Sep–May)"],
+        "Season", ["All months", "High demand (Jun–Aug)", "Low demand (Sep–May)"],
         horizontal=True, key="argo_season",
     )
 
+    # ── Per-hour attribution ───────────────────────────────────────────────────
     _h = hourly.copy()
-    _charge_total = _h["batt_charge_kwh"].replace(0, np.nan)
+    _charge_total       = _h["batt_charge_kwh"].replace(0, np.nan)
     _h["solar_to_batt"] = np.minimum(_h["batt_charge_kwh"], _h["solar_kwh"])
+    _h["grid_to_batt"]  = np.maximum(0.0, _h["batt_charge_kwh"] - _h["solar_kwh"])
     _h["solar_frac"]    = (_h["solar_to_batt"] / _charge_total).fillna(0).clip(0, 1)
-    _tariff_map = {(s, t): TARIFF[s][t] for s in ["low","high"] for t in ["1.8.1","1.8.2","1.8.3"]}
-    _h["tariff_rkwh"]            = [_tariff_map.get((s,t),0) for s,t in zip(_h["season"],_h["tou_slot"])]
-    _h["solar_full_r"]           = _h["solar_kwh"] * _h["tariff_rkwh"]
-    _h["solar_argo_r"]           = _h["solar_full_r"] * (1 - ARGO_DISCOUNT)
-    _h["disc_solar_peak_kwh"]    = np.where(_h["tou_slot"]=="1.8.1", _h["batt_discharge_kwh"]*_h["solar_frac"], 0.0)
-    _h["disc_solar_peak_full_r"] = _h["disc_solar_peak_kwh"] * _h["tariff_rkwh"]
-    _h["disc_solar_peak_argo_r"] = _h["disc_solar_peak_full_r"] * (1 - ARGO_DISCOUNT)
-    _h["month"]        = _h["datetime"].dt.to_period("M")
-    _h["month_season"] = _h["datetime"].dt.month.map(lambda m: "High" if m in [6,7,8] else "Low")
+    _h["grid_frac"]     = (_h["grid_to_batt"]  / _charge_total).fillna(0).clip(0, 1)
 
+    _tariff_map = {(s, t): TARIFF[s][t]
+                   for s in ["low", "high"] for t in ["1.8.1", "1.8.2", "1.8.3"]}
+    _h["tariff_rkwh"] = [_tariff_map.get((s, t), 0)
+                         for s, t in zip(_h["season"], _h["tou_slot"])]
+
+    # ── Invoice 1: Voltano → Argo (grid energy used to charge batteries) ───────
+    # grid_to_batt kWh × TOU rate at the hour of charging, in every slot
+    _h["inv1_kwh"] = _h["grid_to_batt"]
+    _h["inv1_r"]   = _h["grid_to_batt"] * _h["tariff_rkwh"]
+
+    # ── Invoice 2: Argo → Voltano ──────────────────────────────────────────────
+    # Line A: all solar production × (production-hour TOU rate × 0.85)
+    _h["inv2a_kwh"] = _h["solar_kwh"]
+    _h["inv2a_r"]   = _h["solar_kwh"] * _h["tariff_rkwh"] * (1 - ARGO_DISCOUNT)
+
+    # Line B: grid-sourced peak discharge × (peak rate × 0.85)
+    # Only rows where tou_slot == 1.8.1 AND grid_frac > 0
+    _h["inv2b_kwh"] = np.where(
+        _h["tou_slot"] == "1.8.1",
+        _h["batt_discharge_kwh"] * _h["grid_frac"], 0.0,
+    )
+    _h["inv2b_r"] = _h["inv2b_kwh"] * _h["tariff_rkwh"] * (1 - ARGO_DISCOUNT)
+
+    # ── Savings: gross value of what solar+battery displaced at full rates ─────
+    # Solar to load: what was consumed directly from solar at production-hour rate
+    _h["solar_to_load"]    = np.maximum(0.0, _h["solar_kwh"] - _h["solar_to_batt"])
+    _h["sav_solar_load_r"] = _h["solar_to_load"] * _h["tariff_rkwh"]
+
+    # All peak discharge at full peak rate (solar + grid sourced combined)
+    _h["sav_disc_peak_kwh"] = np.where(
+        _h["tou_slot"] == "1.8.1", _h["batt_discharge_kwh"], 0.0
+    )
+    _h["sav_disc_peak_r"] = _h["sav_disc_peak_kwh"] * _h["tariff_rkwh"]
+
+    # Calendar month + season
+    _h["month"]        = _h["datetime"].dt.to_period("M")
+    _h["month_season"] = _h["datetime"].dt.month.map(
+        lambda m: "High" if m in [6, 7, 8] else "Low"
+    )
+
+    # Apply season filter
     _hf = _h.copy()
     if season_filter == "High demand (Jun–Aug)":
         _hf = _hf[_hf["month_season"] == "High"]
@@ -3100,96 +3137,222 @@ with tab7:
         _hf = _hf[_hf["month_season"] == "Low"]
 
     if _hf.empty:
-        st.info("No data available for the selected season filter.")
+        st.info("No data for the selected season filter.")
     else:
-        argo_rows = []
+        inv1_rows, inv2_rows, sav_rows = [], [], []
+
         for month, grp in _hf.groupby("month"):
-            season    = grp["month_season"].iloc[0]
-            pk = TARIFF["high" if season=="High" else "low"]["1.8.1"]
-            st_ = TARIFF["high" if season=="High" else "low"]["1.8.2"]
-            op = TARIFF["high" if season=="High" else "low"]["1.8.3"]
-            sol_total = grp["solar_kwh"].sum()
-            sol_peak  = grp[grp["tou_slot"]=="1.8.1"]["solar_kwh"].sum()
-            sol_std   = grp[grp["tou_slot"]=="1.8.2"]["solar_kwh"].sum()
-            sol_opk   = grp[grp["tou_slot"]=="1.8.3"]["solar_kwh"].sum()
-            sol_full  = grp["solar_full_r"].sum()
-            sol_argo  = grp["solar_argo_r"].sum()
-            disc_kwh  = grp["disc_solar_peak_kwh"].sum()
-            disc_full = grp["disc_solar_peak_full_r"].sum()
-            disc_argo = grp["disc_solar_peak_argo_r"].sum()
-            t_full    = sol_full + disc_full
-            t_argo    = sol_argo + disc_argo
-            saving    = t_full  - t_argo
-            argo_rows.append({
-                "Month": str(month), "Season": season,
-                "Peak rate (R/kWh)": round(pk,4), "Std rate (R/kWh)": round(st_,4), "Off-Peak rate (R/kWh)": round(op,4),
-                "Solar Total (kWh)": round(sol_total,3),
-                "Solar — Peak (kWh)": round(sol_peak,3), "Solar — Std (kWh)": round(sol_std,3), "Solar — Off-Peak (kWh)": round(sol_opk,3),
-                "Solar @ full rate (R)": round(sol_full,2), "Solar @ Argo −15% (R)": round(sol_argo,2), "Solar saving (R)": round(sol_full-sol_argo,2),
-                "Disc. solar-peak (kWh)": round(disc_kwh,3),
-                "Disc. @ full rate (R)": round(disc_full,2), "Disc. @ Argo −15% (R)": round(disc_argo,2), "Disc. saving (R)": round(disc_full-disc_argo,2),
-                "Argo Invoice Total (R)": round(t_argo,2), "Full municipal cost (R)": round(t_full,2), "Total saving (R)": round(saving,2),
+            season   = grp["month_season"].iloc[0]
+            pk_rate  = TARIFF["high" if season == "High" else "low"]["1.8.1"]
+            std_rate = TARIFF["high" if season == "High" else "low"]["1.8.2"]
+            op_rate  = TARIFF["high" if season == "High" else "low"]["1.8.3"]
+            label    = str(month)
+
+            # ── Invoice 1 ────────────────────────────────────────────────────
+            i1_total = grp["inv1_kwh"].sum()
+            i1_peak  = grp[grp["tou_slot"]=="1.8.1"]["inv1_kwh"].sum()
+            i1_std   = grp[grp["tou_slot"]=="1.8.2"]["inv1_kwh"].sum()
+            i1_opk   = grp[grp["tou_slot"]=="1.8.3"]["inv1_kwh"].sum()
+            i1_r     = grp["inv1_r"].sum()
+            inv1_rows.append({
+                "Month": label, "Season": season,
+                "Grid→Batt Total (kWh)": round(i1_total, 3),
+                "  — Peak (kWh)":        round(i1_peak, 3),
+                "  — Standard (kWh)":    round(i1_std, 3),
+                "  — Off-Peak (kWh)":    round(i1_opk, 3),
+                "Invoice Amount (R)":    round(i1_r, 2),
             })
 
-        argo_df = pd.DataFrame(argo_rows)
+            # ── Invoice 2 ────────────────────────────────────────────────────
+            i2a_kwh  = grp["inv2a_kwh"].sum()
+            i2a_pk   = grp[grp["tou_slot"]=="1.8.1"]["inv2a_kwh"].sum()
+            i2a_std  = grp[grp["tou_slot"]=="1.8.2"]["inv2a_kwh"].sum()
+            i2a_opk  = grp[grp["tou_slot"]=="1.8.3"]["inv2a_kwh"].sum()
+            i2a_r    = grp["inv2a_r"].sum()
+            i2b_kwh  = grp["inv2b_kwh"].sum()
+            i2b_r    = grp["inv2b_r"].sum()
+            i2_total = round(i2a_r + i2b_r, 2)
+            inv2_rows.append({
+                "Month": label, "Season": season,
+                "Solar Total (kWh)":        round(i2a_kwh, 3),
+                "  Solar — Peak (kWh)":     round(i2a_pk, 3),
+                "  Solar — Std (kWh)":      round(i2a_std, 3),
+                "  Solar — Off-Pk (kWh)":   round(i2a_opk, 3),
+                "Solar line (R)":           round(i2a_r, 2),
+                "Grid peak disc. (kWh)":    round(i2b_kwh, 3),
+                "Disc. line (R)":           round(i2b_r, 2),
+                "Invoice Total (R)":        i2_total,
+            })
 
-        st.subheader("📋 Monthly Argo invoice")
-        fmt_r, fmt_k = "R {:,.2f}", "{:.3f}"
-        argo_fmt = {
-            "Peak rate (R/kWh)":"{:.4f}","Std rate (R/kWh)":"{:.4f}","Off-Peak rate (R/kWh)":"{:.4f}",
-            "Solar Total (kWh)":fmt_k,"Solar — Peak (kWh)":fmt_k,"Solar — Std (kWh)":fmt_k,"Solar — Off-Peak (kWh)":fmt_k,
-            "Solar @ full rate (R)":fmt_r,"Solar @ Argo −15% (R)":fmt_r,"Solar saving (R)":fmt_r,
-            "Disc. solar-peak (kWh)":fmt_k,"Disc. @ full rate (R)":fmt_r,"Disc. @ Argo −15% (R)":fmt_r,"Disc. saving (R)":fmt_r,
-            "Argo Invoice Total (R)":fmt_r,"Full municipal cost (R)":fmt_r,"Total saving (R)":fmt_r,
+            # ── Net between invoices ─────────────────────────────────────────
+            # (useful to show on same row for cash-flow understanding)
+
+            # ── Savings ──────────────────────────────────────────────────────
+            s_sol_kwh  = grp["solar_to_load"].sum()
+            s_sol_r    = grp["sav_solar_load_r"].sum()
+            s_disc_kwh = grp["sav_disc_peak_kwh"].sum()
+            s_disc_r   = grp["sav_disc_peak_r"].sum()
+            s_total    = round(s_sol_r + s_disc_r, 2)
+            sav_rows.append({
+                "Month": label, "Season": season,
+                "Solar→Load (kWh)":    round(s_sol_kwh, 3),
+                "Solar→Load value (R)": round(s_sol_r, 2),
+                "Peak disc. (kWh)":    round(s_disc_kwh, 3),
+                "Peak disc. value (R)": round(s_disc_r, 2),
+                "Gross value (R)":     s_total,
+            })
+
+        inv1_df = pd.DataFrame(inv1_rows)
+        inv2_df = pd.DataFrame(inv2_rows)
+        sav_df  = pd.DataFrame(sav_rows)
+
+        fmt_r = "R {:,.2f}"
+        fmt_k = "{:.3f}"
+
+        # ══════════════════════════════════════════════════════════════════════
+        # INVOICE 1
+        # ══════════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("📄 Invoice 1 — Voltano Metering → Argo")
+        st.caption(
+            "Voltano charges Argo for all grid energy used to charge the "
+            "batteries, at the TOU rate in effect at the time of charging. "
+            "This covers the municipality's cost for the energy Argo "
+            "then re-sells back to Voltano as peak discharge."
+        )
+        inv1_fmt = {
+            "Grid→Batt Total (kWh)": fmt_k, "  — Peak (kWh)": fmt_k,
+            "  — Standard (kWh)": fmt_k, "  — Off-Peak (kWh)": fmt_k,
+            "Invoice Amount (R)": fmt_r,
         }
-        def _sc(val):
-            try: return "color: #1D9E75" if float(val)>0 else "color: #E24B4A"
-            except: return ""
-        st.dataframe(
-            argo_df.style.format(argo_fmt).map(_sc, subset=["Total saving (R)","Solar saving (R)","Disc. saving (R)"]),
-            use_container_width=True, hide_index=True,
+        st.dataframe(inv1_df.style.format(inv1_fmt),
+                     use_container_width=True, hide_index=True)
+
+        t1_kwh = inv1_df["Grid→Batt Total (kWh)"].sum()
+        t1_r   = inv1_df["Invoice Amount (R)"].sum()
+        m1, m2 = st.columns(2)
+        m1.metric("Total grid→battery", f"{t1_kwh:,.1f} kWh")
+        m2.metric("Total invoice", f"R {t1_r:,.2f}")
+
+        st.download_button("⬇️ Download Invoice 1 CSV",
+            inv1_df.to_csv(index=False).encode(),
+            file_name=f"{site_name}_invoice1_voltano_to_argo.csv",
+            mime="text/csv", key="dl_inv1")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # INVOICE 2
+        # ══════════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("📄 Invoice 2 — Argo → Voltano Metering")
+        st.caption(
+            "Argo charges Voltano for: ① all solar production at the "
+            "TOU rate in effect at the hour of production − 15%, and "
+            "② the grid-sourced portion of peak battery discharge at "
+            "peak rate − 15%."
         )
+        inv2_fmt = {
+            "Solar Total (kWh)": fmt_k, "  Solar — Peak (kWh)": fmt_k,
+            "  Solar — Std (kWh)": fmt_k, "  Solar — Off-Pk (kWh)": fmt_k,
+            "Solar line (R)": fmt_r, "Grid peak disc. (kWh)": fmt_k,
+            "Disc. line (R)": fmt_r, "Invoice Total (R)": fmt_r,
+        }
+        st.dataframe(inv2_df.style.format(inv2_fmt),
+                     use_container_width=True, hide_index=True)
 
-        st.markdown("---")
-        t_sol   = argo_df["Solar Total (kWh)"].sum()
-        t_disc  = argo_df["Disc. solar-peak (kWh)"].sum()
-        t_argo  = argo_df["Argo Invoice Total (R)"].sum()
-        t_full  = argo_df["Full municipal cost (R)"].sum()
-        t_save  = argo_df["Total saving (R)"].sum()
-        t_pct   = 100*t_save/t_full if t_full>0 else 0
-        n_m     = max(len(argo_df),1)
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        c1.metric("Solar produced", f"{t_sol:,.1f} kWh")
-        c2.metric("Solar peak discharge", f"{t_disc:,.1f} kWh")
-        c3.metric("Argo invoice total", f"R {t_argo:,.2f}")
-        c4.metric("Full municipal cost", f"R {t_full:,.2f}")
-        c5.metric("Total saving", f"R {t_save:,.2f}", delta=f"{t_pct:.1f}% cheaper")
-        c6.metric("Avg saving / month", f"R {t_save/n_m:,.2f}")
+        t2_sol_kwh  = inv2_df["Solar Total (kWh)"].sum()
+        t2_disc_kwh = inv2_df["Grid peak disc. (kWh)"].sum()
+        t2_sol_r    = inv2_df["Solar line (R)"].sum()
+        t2_disc_r   = inv2_df["Disc. line (R)"].sum()
+        t2_total    = inv2_df["Invoice Total (R)"].sum()
+        n2, n3, n4, n5 = st.columns(4)
+        n2.metric("Solar produced", f"{t2_sol_kwh:,.1f} kWh")
+        n3.metric("Grid peak disc.", f"{t2_disc_kwh:,.1f} kWh")
+        n4.metric("Solar line total", f"R {t2_sol_r:,.2f}")
+        n5.metric("Invoice 2 total", f"R {t2_total:,.2f}")
 
-        st.markdown("---")
-        st.subheader("📈 Monthly invoice vs full municipal cost")
-        fig_argo = go.Figure()
-        fig_argo.add_bar(x=argo_df["Month"],y=argo_df["Argo Invoice Total (R)"],name="Argo invoice (paid)",marker_color="#1D9E75")
-        fig_argo.add_bar(x=argo_df["Month"],y=argo_df["Total saving (R)"],name="Saving (15% discount)",marker_color="rgba(239,159,39,0.7)")
-        fig_argo.add_scatter(x=argo_df["Month"],y=argo_df["Full municipal cost (R)"],name="Full rate cost",mode="lines+markers",line=dict(color="#E24B4A",width=2,dash="dot"))
-        fig_argo.update_layout(barmode="stack",height=380,yaxis_title="Rand (R)",legend=dict(orientation="h",yanchor="bottom",y=1.02,x=0),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",margin=dict(t=10,b=10))
-        fig_argo.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_argo.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-        st.plotly_chart(fig_argo, use_container_width=True)
+        # Net position: Invoice 2 − Invoice 1 = what Voltano pays Argo net
+        net_r = t2_total - t1_r
+        st.metric("Net (Argo invoice − Voltano invoice)",
+                  f"R {net_r:,.2f}",
+                  delta="Voltano pays Argo this net amount",
+                  delta_color="off")
 
-        st.subheader("☀️ Solar production by TOU slot — monthly")
-        fig_sol = go.Figure()
-        fig_sol.add_bar(x=argo_df["Month"],y=argo_df["Solar — Peak (kWh)"],name="Peak",marker_color="#E24B4A")
-        fig_sol.add_bar(x=argo_df["Month"],y=argo_df["Solar — Std (kWh)"],name="Standard",marker_color="#EF9F27")
-        fig_sol.add_bar(x=argo_df["Month"],y=argo_df["Solar — Off-Peak (kWh)"],name="Off-Peak",marker_color="#1D9E75")
-        fig_sol.update_layout(barmode="stack",height=320,yaxis_title="kWh",legend=dict(orientation="h",yanchor="bottom",y=1.02,x=0),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",margin=dict(t=10,b=10))
-        fig_sol.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
-        fig_sol.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
-        st.plotly_chart(fig_sol, use_container_width=True)
+        st.download_button("⬇️ Download Invoice 2 CSV",
+            inv2_df.to_csv(index=False).encode(),
+            file_name=f"{site_name}_invoice2_argo_to_voltano.csv",
+            mime="text/csv", key="dl_inv2")
 
-        st.download_button(
-            "⬇️ Download Argo billing CSV",
-            argo_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{site_name}_argo_billing.csv",
-            mime="text/csv",
+        # ── Monthly invoice comparison chart ───────────────────────────────────
+        fig_inv = go.Figure()
+        fig_inv.add_bar(x=inv2_df["Month"], y=inv2_df["Invoice Total (R)"],
+                        name="Invoice 2: Argo→Voltano", marker_color="#E24B4A")
+        fig_inv.add_bar(x=inv1_df["Month"], y=inv1_df["Invoice Amount (R)"],
+                        name="Invoice 1: Voltano→Argo", marker_color="#1D9E75")
+        fig_inv.add_scatter(x=inv2_df["Month"],
+                            y=(inv2_df["Invoice Total (R)"] - inv1_df["Invoice Amount (R)"]),
+                            name="Net (Argo−Voltano)", mode="lines+markers",
+                            line=dict(color="#EF9F27", width=2, dash="dot"))
+        fig_inv.update_layout(
+            barmode="group", height=360, yaxis_title="Rand (R)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=10),
         )
+        fig_inv.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_inv.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        st.plotly_chart(fig_inv, use_container_width=True)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SAVINGS ANALYSIS
+        # ══════════════════════════════════════════════════════════════════════
+        st.divider()
+        st.subheader("💰 System savings analysis — gross value at full municipal rates")
+        st.caption(
+            "If Voltano owned the solar+battery system outright, this is the "
+            "gross value of energy it would deliver at full municipal TOU rates "
+            "— no deductions. Two components: solar energy delivered directly "
+            "to load (valued at the production-hour TOU rate), and all battery "
+            "peak discharge (solar + grid sourced, valued at the peak rate). "
+            "This is the theoretical maximum value the system creates before "
+            "any PPA or grid-charging costs are considered."
+        )
+        sav_fmt = {
+            "Solar→Load (kWh)": fmt_k, "Solar→Load value (R)": fmt_r,
+            "Peak disc. (kWh)": fmt_k,  "Peak disc. value (R)": fmt_r,
+            "Gross value (R)": fmt_r,
+        }
+        st.dataframe(sav_df.style.format(sav_fmt),
+                     use_container_width=True, hide_index=True)
+
+        ts_sol_kwh  = sav_df["Solar→Load (kWh)"].sum()
+        ts_sol_r    = sav_df["Solar→Load value (R)"].sum()
+        ts_disc_kwh = sav_df["Peak disc. (kWh)"].sum()
+        ts_disc_r   = sav_df["Peak disc. value (R)"].sum()
+        ts_total    = sav_df["Gross value (R)"].sum()
+
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Solar to load", f"{ts_sol_kwh:,.1f} kWh")
+        s2.metric("Solar to load value", f"R {ts_sol_r:,.2f}")
+        s3.metric("Peak discharge", f"{ts_disc_kwh:,.1f} kWh")
+        s4.metric("Peak disc. value", f"R {ts_disc_r:,.2f}")
+        s5.metric("Total gross value", f"R {ts_total:,.2f}")
+
+        fig_sav = go.Figure()
+        fig_sav.add_bar(x=sav_df["Month"], y=sav_df["Solar→Load value (R)"],
+                        name="Solar→Load", marker_color="#EF9F27")
+        fig_sav.add_bar(x=sav_df["Month"], y=sav_df["Peak disc. value (R)"],
+                        name="Peak discharge", marker_color="#1D9E75")
+        fig_sav.update_layout(
+            barmode="stack", height=340, yaxis_title="Rand (R)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=10),
+        )
+        fig_sav.update_xaxes(gridcolor="rgba(255,255,255,0.06)")
+        fig_sav.update_yaxes(gridcolor="rgba(255,255,255,0.06)")
+        st.plotly_chart(fig_sav, use_container_width=True)
+
+        st.download_button("⬇️ Download savings analysis CSV",
+            sav_df.to_csv(index=False).encode(),
+            file_name=f"{site_name}_system_savings.csv",
+            mime="text/csv", key="dl_sav")
