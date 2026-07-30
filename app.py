@@ -514,7 +514,8 @@ TARIFF = {
     "low":  {"1.8.1": 3.1682, "1.8.2": 2.5487, "1.8.3": 1.4826},
     "high": {"1.8.1": 5.9163, "1.8.2": 1.9068, "1.8.3": 1.1100},
 }
-SELL_RATE = 3.2795  # R/kWh — flat sell rate regardless of season/TOU
+SELL_RATE     = 3.2795  # R/kWh — flat sell rate regardless of season/TOU
+ARGO_DISCOUNT = 0.15    # 15% discount off municipal bulk TOU rate (Argo PPA agreement)
 
 # ─── TABS ─────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
