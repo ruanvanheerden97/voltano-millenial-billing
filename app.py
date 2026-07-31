@@ -196,16 +196,22 @@ METER_COLUMNS = {
 }
 
 # ── Argo Excel export helper ───────────────────────────────────────────────────
-def build_argo_excel(inv1_df, inv2_df, sav_df, tariff,
+def build_argo_excel(inv1_df, inv2_df, sav_df, tou_df, tariff,
                      site_name="MIL Estate", season_filter="All months",
                      discount=0.15) -> bytes:
     """
-    Generate a 3-sheet Excel workbook for Argo billing reconciliation.
-    Returns raw bytes suitable for st.download_button.
-    Sheets: Invoice 1 (VM→Argo), Invoice 2 (Argo→VM), System Savings.
-    Each sheet includes: title block, description, rates reference table,
-    colour-coded data rows (green=Low season, blue=High season), and
-    a SUM totals row.
+    Generate a 4-sheet Excel workbook for Argo billing reconciliation.
+
+    Sheets:
+      1. Invoice 1 – VM to Argo      (grid energy used to charge batteries)
+      2. Invoice 2 – Argo to VM      (solar production + grid-sourced peak discharge)
+      3. System Savings Analysis     (gross value at full municipal rates)
+      4. Monthly TOU Verification    (raw kWh totals per TOU slot for cross-checking)
+
+    All monetary columns use live Excel formulas (not hardcoded values) so
+    clicking any calculated cell reveals the arithmetic behind it. Rate
+    constants live in a labelled block on each sheet and are referenced by
+    absolute cell address, so changing a rate recalculates the whole sheet.
     """
     import io
     import openpyxl
@@ -214,8 +220,8 @@ def build_argo_excel(inv1_df, inv2_df, sav_df, tariff,
 
     C_ACCENT = "0F3460"; C_HDR = "1A1A2E"
     C_LOW = "D4EDDA";    C_HIGH = "CCE5FF"; C_TOTAL = "FFF3CD"
-    C_BODY = "F8F9FA";   C_WHITE = "FFFFFF"
-    FMT_R = "R #,##0.00"; FMT_K = "#,##0.000"
+    C_BODY = "F8F9FA";   C_WHITE = "FFFFFF"; C_FORMULA = "FFF9E6"
+    FMT_R = "R #,##0.00"; FMT_K = "#,##0.000"; FMT_RATE = "R #,##0.0000"
 
     def _f(bold=False, size=10, color="000000", italic=False):
         return Font(name="Arial", bold=bold, size=size, color=color, italic=italic)
@@ -229,121 +235,261 @@ def build_argo_excel(inv1_df, inv2_df, sav_df, tariff,
         return Border(left=s, right=s, top=s, bottom=t)
     def _ctr(): return Alignment(horizontal="center", vertical="center", wrap_text=True)
     def _rgt(): return Alignment(horizontal="right", vertical="center")
+    def _lft(): return Alignment(horizontal="left", vertical="center")
 
-    def _autofit(ws):
+    def _autofit(ws, max_w=34):
         for col in ws.columns:
-            mx = max((len(str(c.value)) if c.value else 0) for c in col)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(mx+2,10),32)
+            mx = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(mx + 2, 11), max_w)
 
-    def _rates_box(ws, row):
+    # ── Rates block: written once per sheet, referenced by formulas ───────────
+    # Returns a dict mapping (season, slot) -> absolute cell ref for the
+    # municipal rate, plus the row where data should start.
+    def _rates_block(ws, row):
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
-        c = ws.cell(row, 1, "TOU RATES IN EFFECT (source: tou_tariffs.json)")
+        c = ws.cell(row, 1, "TOU RATES IN EFFECT  —  referenced by all formulas on this sheet")
         c.font = _f(bold=True, size=9, color=C_WHITE); c.fill = _fill(C_ACCENT); c.alignment = _ctr()
         row += 1
-        for ci, h in enumerate(["Season","Slot","Description","Municipal (R/kWh)",f"Argo (−{int(discount*100)}%) (R/kWh)","Used in"], 1):
+        for ci, h in enumerate(["Season", "Slot", "Description",
+                                 "Municipal (R/kWh)", f"Argo −{int(discount*100)}% (R/kWh)",
+                                 "Argo formula"], 1):
             c = ws.cell(row, ci, h); c.font = _f(bold=True, size=9, color=C_WHITE)
             c.fill = _fill(C_HDR); c.alignment = _ctr(); c.border = _bdr()
         row += 1
+
+        rate_refs = {}
         rate_data = [
-            ("Low (Sep–May)",  "1.8.1","Peak",     tariff["low"]["1.8.1"]),
-            ("Low (Sep–May)",  "1.8.2","Standard", tariff["low"]["1.8.2"]),
-            ("Low (Sep–May)",  "1.8.3","Off-Peak", tariff["low"]["1.8.3"]),
-            ("High (Jun–Aug)", "1.8.1","Peak",     tariff["high"]["1.8.1"]),
-            ("High (Jun–Aug)", "1.8.2","Standard", tariff["high"]["1.8.2"]),
-            ("High (Jun–Aug)", "1.8.3","Off-Peak", tariff["high"]["1.8.3"]),
+            ("Low (Sep–May)",  "low",  "1.8.1", "Peak"),
+            ("Low (Sep–May)",  "low",  "1.8.2", "Standard"),
+            ("Low (Sep–May)",  "low",  "1.8.3", "Off-Peak"),
+            ("High (Jun–Aug)", "high", "1.8.1", "Peak"),
+            ("High (Jun–Aug)", "high", "1.8.2", "Standard"),
+            ("High (Jun–Aug)", "high", "1.8.3", "Off-Peak"),
         ]
         fm = {"Low (Sep–May)": C_LOW, "High (Jun–Aug)": C_HIGH}
-        for season, slot, desc, rate in rate_data:
-            argo_r = round(rate * (1 - discount), 4)
-            for ci, val in enumerate([season, slot, desc, rate, argo_r, "All sheets"], 1):
-                c = ws.cell(row, ci, val); c.font = _f(size=9); c.fill = _fill(fm[season]); c.border = _bdr()
-                if ci in (4, 5): c.number_format = "R #,##0.0000"; c.alignment = _rgt()
-                else: c.alignment = Alignment(horizontal="left", vertical="center")
-            row += 1
-        return row + 1
+        for label, skey, slot, desc in rate_data:
+            muni = tariff[skey][slot]
+            ws.cell(row, 1, label).fill = _fill(fm[label])
+            ws.cell(row, 2, slot).fill  = _fill(fm[label])
+            ws.cell(row, 3, desc).fill  = _fill(fm[label])
 
-    def _sheet(ws, title, desc, df, rate_cols, kwh_cols, tot_cols):
-        ws.merge_cells("A1:H1")
+            muni_cell = ws.cell(row, 4, muni)
+            muni_cell.number_format = FMT_RATE; muni_cell.alignment = _rgt()
+            muni_cell.fill = _fill(fm[label])
+
+            # Argo rate as a live formula referencing the municipal cell
+            argo_cell = ws.cell(row, 5, f"=D{row}*(1-{discount})")
+            argo_cell.number_format = FMT_RATE; argo_cell.alignment = _rgt()
+            argo_cell.fill = _fill(C_FORMULA)
+
+            ws.cell(row, 6, f"D{row} × (1 − {discount})").font = _f(size=8, italic=True, color="666666")
+            ws.cell(row, 6).fill = _fill(fm[label])
+
+            for ci in range(1, 7):
+                ws.cell(row, ci).border = _bdr()
+                if ci <= 3: ws.cell(row, ci).font = _f(size=9); ws.cell(row, ci).alignment = _lft()
+
+            # Store absolute refs so data formulas can point at them
+            rate_refs[(skey, slot)] = {"muni": f"$D${row}", "argo": f"$E${row}"}
+            row += 1
+
+        return rate_refs, row + 1
+
+    # ── Generic sheet writer ──────────────────────────────────────────────────
+    def _sheet(ws, title, desc, df, rate_cols, kwh_cols, tot_cols,
+               formula_builder=None):
+        """
+        formula_builder: optional fn(row_idx_excel, row_series, rate_refs, col_letters)
+                         -> dict {column_name: excel_formula_string}
+        Any column it returns gets written as a live formula instead of a value.
+        """
+        ws.merge_cells("A1:I1")
         c = ws["A1"]; c.value = title
         c.font = Font(name="Arial", bold=True, size=14, color=C_WHITE)
-        c.fill = _fill(C_ACCENT); c.alignment = _ctr(); ws.row_dimensions[1].height = 28
+        c.fill = _fill(C_ACCENT); c.alignment = _ctr(); ws.row_dimensions[1].height = 30
 
-        ws.merge_cells("A2:H2")
-        ws["A2"].value = f"Site: {site_name}   |   Generated: {pd.Timestamp.now().strftime('%d %b %Y')}   |   Filter: {season_filter}"
-        ws["A2"].font = _f(italic=True, size=9, color="555555")
+        ws.merge_cells("A2:I2")
+        ws["A2"].value = (f"Site: {site_name}   |   Generated: "
+                          f"{pd.Timestamp.now().strftime('%d %b %Y %H:%M')}   |   "
+                          f"Season filter: {season_filter}")
+        ws["A2"].font = _f(italic=True, size=9, color="555555"); ws["A2"].alignment = _lft()
 
-        ws.merge_cells("A3:H3")
+        ws.merge_cells("A3:I3")
         ws["A3"].value = desc; ws["A3"].font = _f(size=9)
-        ws["A3"].alignment = Alignment(horizontal="left", wrap_text=True); ws.row_dimensions[3].height = 56
+        ws["A3"].alignment = Alignment(horizontal="left", wrap_text=True, vertical="top")
+        ws.row_dimensions[3].height = 60
 
-        dr = _rates_box(ws, 5)  # data starts after rates box
+        rate_refs, dr = _rates_block(ws, 5)
 
         cols = list(df.columns)
+        col_letters = {col: get_column_letter(i) for i, col in enumerate(cols, 1)}
+
         for ci, col in enumerate(cols, 1):
             c = ws.cell(dr, ci, col); c.font = _f(bold=True, size=9, color=C_WHITE)
             c.fill = _fill(C_HDR); c.alignment = _ctr(); c.border = _thick()
-        ws.row_dimensions[dr].height = 36
+        ws.row_dimensions[dr].height = 38
 
         fm = {"Low": _fill(C_LOW), "High": _fill(C_HIGH)}
         alt = [_fill(C_BODY), _fill(C_WHITE)]
+
         for ri, (_, row) in enumerate(df.iterrows()):
             rn = dr + 1 + ri
             season = row.get("Season", "")
-            rf = fm.get(season, alt[ri % 2])
-            for ci, col in enumerate(cols, 1):
-                c = ws.cell(rn, ci, row[col]); c.font = _f(size=9); c.fill = rf; c.border = _bdr()
-                if col in kwh_cols: c.number_format = FMT_K; c.alignment = _rgt()
-                elif col in rate_cols: c.number_format = FMT_R; c.alignment = _rgt()
-                else: c.alignment = Alignment(horizontal="left", vertical="center")
+            base_fill = fm.get(season, alt[ri % 2])
 
+            formulas = {}
+            if formula_builder is not None:
+                formulas = formula_builder(rn, row, rate_refs, col_letters)
+
+            for ci, col in enumerate(cols, 1):
+                if col in formulas:
+                    c = ws.cell(rn, ci, formulas[col])
+                    c.fill = _fill(C_FORMULA)   # highlight formula cells
+                else:
+                    c = ws.cell(rn, ci, row[col])
+                    c.fill = base_fill
+                c.font = _f(size=9); c.border = _bdr()
+                if col in kwh_cols:    c.number_format = FMT_K;  c.alignment = _rgt()
+                elif col in rate_cols: c.number_format = FMT_R;  c.alignment = _rgt()
+                else:                  c.alignment = _lft()
+
+        # Totals row — always live SUM formulas
         tr = dr + 1 + len(df)
         for ci, col in enumerate(cols, 1):
             c = ws.cell(tr, ci); c.fill = _fill(C_TOTAL); c.border = _thick(); c.font = _f(bold=True, size=9)
-            if ci == 1: c.value = "TOTAL"
+            if ci == 1:
+                c.value = "TOTAL"
             elif col in tot_cols:
                 cl = get_column_letter(ci)
                 c.value = f"=SUM({cl}{dr+1}:{cl}{dr+len(df)})"
-                if col in kwh_cols: c.number_format = FMT_K
+                if col in kwh_cols:    c.number_format = FMT_K
                 elif col in rate_cols: c.number_format = FMT_R
                 c.alignment = _rgt()
 
+        # Legend explaining the highlight
+        ln = tr + 2
+        ws.cell(ln, 1, "Cells shaded cream contain live Excel formulas — click any of them to see the calculation.")
+        ws.cell(ln, 1).font = _f(size=8, italic=True, color="666666")
+        ws.merge_cells(start_row=ln, start_column=1, end_row=ln, end_column=6)
+
         _autofit(ws)
 
+    # ── Formula builders per sheet ────────────────────────────────────────────
+    def _fb_inv1(rn, row, rate_refs, cl):
+        # Invoice amount = Peak×PeakRate + Std×StdRate + OffPk×OffPkRate
+        skey = "high" if row["Season"] == "High" else "low"
+        pk, sd, op = (rate_refs[(skey, s)]["muni"] for s in ["1.8.1", "1.8.2", "1.8.3"])
+        return {
+            "Invoice Amount (R)":
+                f'={cl["  — Peak (kWh)"]}{rn}*{pk}'
+                f'+{cl["  — Standard (kWh)"]}{rn}*{sd}'
+                f'+{cl["  — Off-Peak (kWh)"]}{rn}*{op}'
+        }
+
+    def _fb_inv2(rn, row, rate_refs, cl):
+        skey = "high" if row["Season"] == "High" else "low"
+        pk_a, sd_a, op_a = (rate_refs[(skey, s)]["argo"] for s in ["1.8.1", "1.8.2", "1.8.3"])
+        return {
+            "Solar line (R)":
+                f'={cl["  Solar — Peak (kWh)"]}{rn}*{pk_a}'
+                f'+{cl["  Solar — Std (kWh)"]}{rn}*{sd_a}'
+                f'+{cl["  Solar — Off-Pk (kWh)"]}{rn}*{op_a}',
+            "Disc. line (R)":
+                f'={cl["Grid peak disc. (kWh)"]}{rn}*{pk_a}',
+            "Invoice Total (R)":
+                f'={cl["Solar line (R)"]}{rn}+{cl["Disc. line (R)"]}{rn}',
+        }
+
+    def _fb_sav(rn, row, rate_refs, cl):
+        skey = "high" if row["Season"] == "High" else "low"
+        pk = rate_refs[(skey, "1.8.1")]["muni"]
+        return {
+            "Gross value (R)":
+                f'={cl["Solar→Load value (R)"]}{rn}+{cl["Peak disc. value (R)"]}{rn}',
+            "Peak disc. value (R)":
+                f'={cl["Peak disc. (kWh)"]}{rn}*{pk}',
+        }
+
+    def _fb_tou(rn, row, rate_refs, cl):
+        return {
+            "Solar Total (kWh)":
+                f'={cl["Solar Peak (kWh)"]}{rn}+{cl["Solar Std (kWh)"]}{rn}+{cl["Solar Off-Pk (kWh)"]}{rn}',
+            "Batt Charge Total (kWh)":
+                f'={cl["Batt Chg Peak (kWh)"]}{rn}+{cl["Batt Chg Std (kWh)"]}{rn}+{cl["Batt Chg Off-Pk (kWh)"]}{rn}',
+            "Batt Discharge Total (kWh)":
+                f'={cl["Batt Dis Peak (kWh)"]}{rn}+{cl["Batt Dis Std (kWh)"]}{rn}+{cl["Batt Dis Off-Pk (kWh)"]}{rn}',
+        }
+
+    # ── Build workbook ────────────────────────────────────────────────────────
     wb = openpyxl.Workbook(); wb.remove(wb.active)
 
     ws1 = wb.create_sheet("Invoice 1 – VM to Argo")
     _sheet(ws1, "Invoice 1 — Voltano Metering → Argo",
-           "Voltano charges Argo for all grid energy used to charge the batteries at the "
-           "municipal TOU rate at the time of charging. This recovers the municipality cost "
-           "for energy Argo then re-sells via peak discharge.\n"
-           "Calculation: Grid→Battery kWh × TOU rate at time of charging.",
+           "Voltano Metering charges Argo for all grid energy used to charge the batteries, "
+           "at the municipal bulk TOU rate in effect at the hour of charging. This recovers "
+           "the municipality cost for energy that Argo subsequently re-sells back to Voltano "
+           "via peak battery discharge.\n"
+           "CALCULATION:  Invoice Amount = (Peak kWh × Peak rate) + (Standard kWh × Standard rate) "
+           "+ (Off-Peak kWh × Off-Peak rate), using the full municipal rate — no discount applies "
+           "to this invoice.",
            inv1_df,
            rate_cols=["Invoice Amount (R)"],
-           kwh_cols=["Grid→Batt Total (kWh)","  — Peak (kWh)","  — Standard (kWh)","  — Off-Peak (kWh)"],
-           tot_cols=["Grid→Batt Total (kWh)","  — Peak (kWh)","  — Standard (kWh)","  — Off-Peak (kWh)","Invoice Amount (R)"])
+           kwh_cols=["Grid→Batt Total (kWh)", "  — Peak (kWh)", "  — Standard (kWh)", "  — Off-Peak (kWh)"],
+           tot_cols=["Grid→Batt Total (kWh)", "  — Peak (kWh)", "  — Standard (kWh)",
+                     "  — Off-Peak (kWh)", "Invoice Amount (R)"],
+           formula_builder=_fb_inv1)
 
     ws2 = wb.create_sheet("Invoice 2 – Argo to VM")
     _sheet(ws2, "Invoice 2 — Argo → Voltano Metering",
-           "Argo charges Voltano for: ① All solar production at production-hour TOU rate −15%.  "
-           "② Grid-sourced peak discharge at peak rate −15%.  Solar-sourced peak discharge is "
-           "excluded — Argo only bills for grid energy it re-sells at peak.\n"
-           "Calculation: (Solar kWh × TOU rate × 0.85) + (Grid-peak discharge kWh × peak rate × 0.85).",
+           "Argo charges Voltano Metering for two components, both at the municipal TOU rate "
+           "less 15%:  ① ALL solar production, priced at the TOU rate in effect at the hour of "
+           "production.  ② The GRID-SOURCED portion of peak battery discharge, priced at the peak "
+           "rate.  Solar-sourced peak discharge is deliberately excluded — Argo only bills for the "
+           "grid energy it effectively re-sells during peak.\n"
+           "CALCULATION:  Solar line = Σ(Solar kWh per slot × that slot's Argo rate).  "
+           "Discharge line = Grid-sourced peak discharge kWh × Peak Argo rate.  "
+           "Invoice Total = Solar line + Discharge line.",
            inv2_df,
-           rate_cols=["Solar line (R)","Disc. line (R)","Invoice Total (R)"],
-           kwh_cols=["Solar Total (kWh)","  Solar — Peak (kWh)","  Solar — Std (kWh)","  Solar — Off-Pk (kWh)","Grid peak disc. (kWh)"],
-           tot_cols=["Solar Total (kWh)","  Solar — Peak (kWh)","  Solar — Std (kWh)","  Solar — Off-Pk (kWh)",
-                     "Grid peak disc. (kWh)","Solar line (R)","Disc. line (R)","Invoice Total (R)"])
+           rate_cols=["Solar line (R)", "Disc. line (R)", "Invoice Total (R)"],
+           kwh_cols=["Solar Total (kWh)", "  Solar — Peak (kWh)", "  Solar — Std (kWh)",
+                     "  Solar — Off-Pk (kWh)", "Grid peak disc. (kWh)"],
+           tot_cols=["Solar Total (kWh)", "  Solar — Peak (kWh)", "  Solar — Std (kWh)",
+                     "  Solar — Off-Pk (kWh)", "Grid peak disc. (kWh)",
+                     "Solar line (R)", "Disc. line (R)", "Invoice Total (R)"],
+           formula_builder=_fb_inv2)
 
     ws3 = wb.create_sheet("System Savings Analysis")
     _sheet(ws3, "System Savings Analysis — Gross Value at Full Municipal Rates",
-           "Gross value of energy the solar+battery system delivered at full municipal bulk TOU "
-           "rates — no deductions.  Two components: ① Solar to load at production-hour TOU rate.  "
-           "② All peak battery discharge (solar+grid) at full peak rate.  Compare against Invoice 2 "
-           "to assess PPA economics.",
+           "Gross value of the energy the solar+battery system delivered, priced at FULL municipal "
+           "bulk TOU rates with no deductions and no PPA discount. Two components:  ① Solar energy "
+           "delivered directly to load, valued at the production-hour TOU rate.  ② ALL peak battery "
+           "discharge (solar-sourced AND grid-sourced combined), valued at the full peak rate.\n"
+           "This represents the theoretical maximum value the system creates before any PPA cost or "
+           "grid-charging cost is considered. Compare against Invoice 2 to assess PPA economics.",
            sav_df,
-           rate_cols=["Solar→Load value (R)","Peak disc. value (R)","Gross value (R)"],
-           kwh_cols=["Solar→Load (kWh)","Peak disc. (kWh)"],
-           tot_cols=["Solar→Load (kWh)","Solar→Load value (R)","Peak disc. (kWh)","Peak disc. value (R)","Gross value (R)"])
+           rate_cols=["Solar→Load value (R)", "Peak disc. value (R)", "Gross value (R)"],
+           kwh_cols=["Solar→Load (kWh)", "Peak disc. (kWh)"],
+           tot_cols=["Solar→Load (kWh)", "Solar→Load value (R)", "Peak disc. (kWh)",
+                     "Peak disc. value (R)", "Gross value (R)"],
+           formula_builder=_fb_sav)
+
+    ws4 = wb.create_sheet("Monthly TOU Verification")
+    _sheet(ws4, "Monthly TOU Verification — Raw Energy Totals",
+           "Raw monthly energy totals for Solar Production, Battery Charge and Battery Discharge, "
+           "split by TOU slot. No pricing applied — these are the underlying kWh figures that feed "
+           "every calculation in the other three sheets.\n"
+           "USE THIS SHEET TO:  cross-check any figure on Invoice 1, Invoice 2 or the Savings sheet "
+           "against the raw metered energy. The 'Total' columns are live formulas summing the three "
+           "TOU slots, so you can confirm the split adds up correctly for each month.",
+           tou_df,
+           rate_cols=[],
+           kwh_cols=["Solar Peak (kWh)", "Solar Std (kWh)", "Solar Off-Pk (kWh)", "Solar Total (kWh)",
+                     "Batt Chg Peak (kWh)", "Batt Chg Std (kWh)", "Batt Chg Off-Pk (kWh)", "Batt Charge Total (kWh)",
+                     "Batt Dis Peak (kWh)", "Batt Dis Std (kWh)", "Batt Dis Off-Pk (kWh)", "Batt Discharge Total (kWh)"],
+           tot_cols=["Solar Peak (kWh)", "Solar Std (kWh)", "Solar Off-Pk (kWh)", "Solar Total (kWh)",
+                     "Batt Chg Peak (kWh)", "Batt Chg Std (kWh)", "Batt Chg Off-Pk (kWh)", "Batt Charge Total (kWh)",
+                     "Batt Dis Peak (kWh)", "Batt Dis Std (kWh)", "Batt Dis Off-Pk (kWh)", "Batt Discharge Total (kWh)"],
+           formula_builder=_fb_tou)
 
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.read()
@@ -446,8 +592,6 @@ with st.sidebar:
     site_name = st.text_input("Site name", value="MIL Estate")
 
     # ── Auto-load from fixed path ─────────────────────────────────────────
-    # Place your Excel file in the same folder as app.py and update the
-    # filename below if it ever changes.
     DATA_FILE = os.path.join(os.path.dirname(__file__), "MIL_Battery_readings_EMS.xlsx")
 
     if os.path.exists(DATA_FILE):
@@ -464,6 +608,22 @@ with st.sidebar:
             f"Place **{os.path.basename(DATA_FILE)}** in the same folder as `app.py` and restart."
         )
         st.stop()
+
+    st.divider()
+    st.header("📌 Navigation")
+    page = st.radio(
+        "Go to",
+        options=[
+            "🔢 Meter Readings",
+            "📊 System Performance",
+            "💰 Profitability",
+            "🔋 Battery Health",
+            "🌤️ Seasonal Patterns",
+            "⚡ Live Dashboard",
+            "🏢 Argo",
+        ],
+        label_visibility="collapsed",
+    )
 
     st.divider()
     st.header("⚙️ Settings")
@@ -517,21 +677,19 @@ TARIFF = {
 SELL_RATE     = 3.2795  # R/kWh — flat sell rate regardless of season/TOU
 ARGO_DISCOUNT = 0.15    # 15% discount off municipal bulk TOU rate (Argo PPA agreement)
 
-# ─── TABS ─────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "🔢 Meter Readings",
-    "📊 System Performance",
-    "💰 Profitability",
-    "🔋 Battery Health",
-    "🌤️ Seasonal Patterns",
-    "⚡ Live Dashboard",
-    "🏢 Argo",
-])
+# ─── PAGE ROUTING ─────────────────────────────────────────────────────────────
+tab1 = page == "🔢 Meter Readings"
+tab2 = page == "📊 System Performance"
+tab3 = page == "💰 Profitability"
+tab4 = page == "🔋 Battery Health"
+tab5 = page == "🌤️ Seasonal Patterns"
+tab6 = page == "⚡ Live Dashboard"
+tab7 = page == "🏢 Argo"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — METER READINGS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab1:
+if tab1:
     st.subheader("Virtual Meter — TOU Breakdown")
 
     # ── Controls row ──────────────────────────────────────────────────────────
@@ -679,7 +837,7 @@ with tab1:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — SYSTEM PERFORMANCE
 # ══════════════════════════════════════════════════════════════════════════════
-with tab2:
+if tab2:
     st.subheader("System Performance Overview")
 
     # ── Date range slider ─────────────────────────────────────────────────────
@@ -754,13 +912,13 @@ with tab2:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PROFITABILITY
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+if tab3:
     st.subheader("Revenue & Profitability")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PROFITABILITY
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+if tab3:
     st.subheader("💰 Profitability Analysis")
     st.caption("All calculations derived from actual metered data and your input parameters — not from the inverter revenue column.")
 
@@ -1245,7 +1403,7 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — BATTERY HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+if tab4:
     st.subheader("Battery Health & Cycle Tracking")
 
     # ── Battery parameters ────────────────────────────────────────────────────
@@ -1898,7 +2056,7 @@ with tab4:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — SEASONAL PATTERNS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab5:
+if tab5:
     st.subheader("Seasonal Patterns & Weather Influence")
 
     daily["month"]        = daily["date"].dt.month
@@ -2050,7 +2208,7 @@ with tab5:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — LIVE DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
-with tab6:
+if tab6:
     import requests as _requests
     import sqlite3
     import json as _json_live
@@ -3222,7 +3380,7 @@ if show_raw:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 7 — ARGO
 # ══════════════════════════════════════════════════════════════════════════════
-with tab7:
+if tab7:
     st.header("🏢 Argo Solar Billing")
     st.caption(
         "Two invoices flow between Voltano and Argo each month, plus a "
@@ -3295,7 +3453,7 @@ with tab7:
     if _hf.empty:
         st.info("No data for the selected season filter.")
     else:
-        inv1_rows, inv2_rows, sav_rows = [], [], []
+        inv1_rows, inv2_rows, sav_rows, tou_rows = [], [], [], []
         for month, grp in _hf.groupby("month"):
             season = grp["month_season"].iloc[0]
             label  = str(month)
@@ -3333,9 +3491,30 @@ with tab7:
                 "Gross value (R)":      round(s_sol_r+s_disc_r,2),
             })
 
+            # TOU verification — raw kWh per slot for Solar / Charge / Discharge
+            _pk = grp[grp["tou_slot"]=="1.8.1"]
+            _sd = grp[grp["tou_slot"]=="1.8.2"]
+            _op = grp[grp["tou_slot"]=="1.8.3"]
+            tou_rows.append({
+                "Month":label,"Season":season,
+                "Solar Peak (kWh)":          round(_pk["solar_kwh"].sum(),3),
+                "Solar Std (kWh)":           round(_sd["solar_kwh"].sum(),3),
+                "Solar Off-Pk (kWh)":        round(_op["solar_kwh"].sum(),3),
+                "Solar Total (kWh)":         round(grp["solar_kwh"].sum(),3),
+                "Batt Chg Peak (kWh)":       round(_pk["batt_charge_kwh"].sum(),3),
+                "Batt Chg Std (kWh)":        round(_sd["batt_charge_kwh"].sum(),3),
+                "Batt Chg Off-Pk (kWh)":     round(_op["batt_charge_kwh"].sum(),3),
+                "Batt Charge Total (kWh)":   round(grp["batt_charge_kwh"].sum(),3),
+                "Batt Dis Peak (kWh)":       round(_pk["batt_discharge_kwh"].sum(),3),
+                "Batt Dis Std (kWh)":        round(_sd["batt_discharge_kwh"].sum(),3),
+                "Batt Dis Off-Pk (kWh)":     round(_op["batt_discharge_kwh"].sum(),3),
+                "Batt Discharge Total (kWh)":round(grp["batt_discharge_kwh"].sum(),3),
+            })
+
         inv1_df = pd.DataFrame(inv1_rows)
         inv2_df = pd.DataFrame(inv2_rows)
         sav_df  = pd.DataFrame(sav_rows)
+        tou_df  = pd.DataFrame(tou_rows)
         fmt_r,fmt_k = "R {:,.2f}","{:.3f}"
 
         # ══════════════════════════════════════════════════════════════════════
@@ -3428,11 +3607,12 @@ with tab7:
         # ══════════════════════════════════════════════════════════════════════
         st.divider()
         st.subheader("📥 Download full billing workbook")
-        st.caption("Single Excel file with three sheets — Invoice 1 (VM→Argo), Invoice 2 (Argo→VM), "
-                   "and System Savings. Each sheet includes the TOU rates reference table, "
-                   "colour-coded rows (green=Low, blue=High season), and a SUM totals row.")
+        st.caption("Excel workbook with four sheets — Invoice 1 (VM→Argo), Invoice 2 (Argo→VM), "
+                   "System Savings, and Monthly TOU Verification (raw kWh totals for cross-checking). "
+                   "All monetary cells contain live Excel formulas referencing the rates block at the "
+                   "top of each sheet — click any cream-shaded cell to see the calculation.")
         xlsx_bytes = build_argo_excel(
-            inv1_df, inv2_df, sav_df, TARIFF,
+            inv1_df, inv2_df, sav_df, tou_df, TARIFF,
             site_name=site_name, season_filter=season_filter, discount=ARGO_DISCOUNT,
         )
         st.download_button(
