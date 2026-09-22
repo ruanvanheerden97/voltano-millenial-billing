@@ -6,6 +6,7 @@ from plotly.subplots import make_subplots
 from datetime import time
 import numpy as np
 import os
+import json
 
 st.set_page_config(
     page_title="Voltano Billing Tool",
@@ -670,12 +671,39 @@ daily["billing_run"] = daily["date"].apply(lambda d: assign_billing_run(d, billi
 daily = daily.sort_values("date").reset_index(drop=True)
 
 # ─── TARIFF CONSTANTS ─────────────────────────────────────────────────────────
-TARIFF = {
-    "low":  {"1.8.1": 3.1682, "1.8.2": 2.5487, "1.8.3": 1.4826},
-    "high": {"1.8.1": 5.9163, "1.8.2": 1.9068, "1.8.3": 1.1100},
-}
-SELL_RATE     = 3.2795  # R/kWh — flat sell rate regardless of season/TOU
-ARGO_DISCOUNT = 0.15    # 15% discount off municipal bulk TOU rate (Argo PPA agreement)
+# Loaded from tou_tariffs.json, NOT hardcoded. push_readings.py, meter_v2.py and
+# billing_readings.py all read that file; this app used to keep its own copy, so
+# editing the JSON changed what went to the EMS but left every rand figure here
+# on the old rates, with nothing to show they had diverged.
+@st.cache_data
+def load_tariff_config() -> dict:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tou_tariffs.json")
+    if not os.path.exists(path):
+        st.error("tou_tariffs.json not found — every rand figure below depends on it.")
+        st.stop()
+    with open(path) as f:
+        cfg = json.load(f)
+    periods = sorted(cfg["periods"], key=lambda p: p["effective_from"])
+    if not periods:
+        st.error("tou_tariffs.json contains no periods.")
+        st.stop()
+    return {"periods": periods}
+
+
+def tariff_period_for(when) -> dict:
+    """The tariff period in force on a given date."""
+    d = pd.Timestamp(when).normalize()
+    current = load_tariff_config()["periods"][0]
+    for p in load_tariff_config()["periods"]:
+        if d >= pd.Timestamp(p["effective_from"]):
+            current = p
+    return current
+
+
+_CURRENT      = load_tariff_config()["periods"][-1]
+TARIFF        = _CURRENT["tariffs_rkwh"]
+SELL_RATE     = _CURRENT.get("sell_rate_rkwh", 3.2795)
+ARGO_DISCOUNT = _CURRENT.get("argo_discount", 0.15)
 
 # ─── PAGE ROUTING ─────────────────────────────────────────────────────────────
 tab1 = page == "🔢 Meter Readings"
